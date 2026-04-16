@@ -132,13 +132,12 @@ class LMClient(_ClientRuntimeMixin):
     -----
     Always call [close][lm_client.LMClient.close] (or use the context-manager form)
     when the client is no longer needed. [close][lm_client.LMClient.close] stops
-    the background [SyncRunner][lm_client.SyncRunner] thread; failing to call it
-    leaves a daemon thread running until process exit.
+    the background `SyncRunner` thread; failing to call it leaves a daemon thread
+    running until process exit.
 
     A single [RateLimiter][lm_client.RateLimiter] instance is shared between
-    the caller's event loop and the [SyncRunner][lm_client.SyncRunner]
-    background loop, so sync and async calls are accounted together and do
-    not double the effective rate.
+    the caller's event loop and the `SyncRunner` background loop, so sync and
+    async calls are accounted together and do not double the effective rate.
 
     See Also
     --------
