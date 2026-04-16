@@ -1,4 +1,4 @@
-"""Command-line interface for ``lm_client``."""
+"""Command-line interface for ``infermesh``."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from lm_client._cli_bench import (
+from infermesh._cli_bench import (
     DEFAULT_EMBED_BATCH_SIZES,
     DEFAULT_SWEEP,
     _build_concurrency_sweep,
@@ -22,7 +22,7 @@ from lm_client._cli_bench import (
     _write_embed_summary,
     _write_generate_summary,
 )
-from lm_client._cli_support import (
+from infermesh._cli_support import (
     ClientConfig,
     _add_connection_args,
     _load_embed_texts,
@@ -32,15 +32,15 @@ from lm_client._cli_support import (
     _token_usage_to_dict,
     _write_jsonl,
 )
-from lm_client._cli_support import (
+from infermesh._cli_support import (
     _build_client as _support_build_client,
 )
-from lm_client._cli_support import (
+from infermesh._cli_support import (
     _client_config_from_args as _support_client_config_from_args,
 )
-from lm_client._utils import batched_cycle
-from lm_client.client import LMClient
-from lm_client.types import EndpointType
+from infermesh._utils import batched_cycle
+from infermesh.client import LMClient
+from infermesh.types import EndpointType
 
 _client_config_from_args = _support_client_config_from_args
 
@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
 
     parser = argparse.ArgumentParser(
-        prog="lm-client",
+        prog="infermesh",
         description=(
             "Run LLM generation, embeddings, transcription, and client-side "
             "benchmarks from scripts, notebooks, and JSONL batches."

@@ -14,7 +14,7 @@ from typing import Any, TypeVar, cast
 import jsonschema
 from pydantic import BaseModel
 
-from lm_client.types import (
+from infermesh.types import (
     ChatInput,
     ChatMessage,
     EmbeddingResult,

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from lm_client import cli
-from lm_client._cli_bench import _compute_generate_recommendation
+from infermesh import cli
+from infermesh._cli_bench import _compute_generate_recommendation
 from tests.fakes import FakeCLIClient
 
 

@@ -12,7 +12,7 @@ The main workflow is "run a batch, keep the good results, inspect the
 failures, and retry only what failed."
 
 ```python
-from lm_client import LMClient
+from infermesh import LMClient
 
 prompts = [
     "Summarize section 1 in two bullet points.",
@@ -60,7 +60,7 @@ Pass an `on_result` callback to `generate_batch` (or `agenerate_batch`):
 ```python
 import json
 from pathlib import Path
-from lm_client import LMClient
+from infermesh import LMClient
 
 prompts = [...]  # large list
 
@@ -153,7 +153,7 @@ For dataset-driven jobs, the CLI can read one JSON object per line.
 Run the batch:
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
@@ -169,7 +169,7 @@ records the row's position in the input file:
 {"_index": 2, "output_text": "Abstract C is about...", "error": null}
 ```
 
-Input rows for `lm-client generate` may contain any of the following fields:
+Input rows for `infermesh generate` may contain any of the following fields:
 
 - `prompt` for a plain string prompt
 - `messages` for a pre-built chat conversation
@@ -183,14 +183,14 @@ append only the remaining rows:
 
 ```bash
 # First attempt — interrupted partway through
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
 # Resume — reads results.jsonl, skips completed _index values, appends the rest
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
@@ -307,13 +307,13 @@ result = client.generate([{
 }])
 ```
 
-For local files or raw bytes, use [`image_block()`][lm_client.image_block] to
+For local files or raw bytes, use [`image_block()`][infermesh.image_block] to
 handle base64 encoding:
 
 ```python
 from pathlib import Path
 
-from lm_client import LMClient, image_block
+from infermesh import LMClient, image_block
 
 with LMClient(model="openai/gpt-4o", api_base="https://api.openai.com/v1") as client:
     result = client.generate([{
@@ -340,7 +340,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --env-file .env \
@@ -386,7 +386,7 @@ name the router exposes; each `DeploymentConfig.model` is the backend string
 sent to that replica.
 
 ```python
-from lm_client import DeploymentConfig, LMClient
+from infermesh import DeploymentConfig, LMClient
 
 client = LMClient(
     model="llama-3-8b",
@@ -414,7 +414,7 @@ print(result.metrics.deployment)
 ### CLI With Repeated `--api-base`
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model llama-3-8b \
   --api-base http://host1:8000/v1 \
   --api-base http://host2:8000/v1 \
@@ -436,7 +436,7 @@ api_base = "http://host2:8000/v1"
 ```
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model llama-3-8b \
   --deployments-toml deployments.toml \
   --prompt "Hello"
@@ -501,7 +501,7 @@ need to manage the loop yourself.
 
 ```python
 import asyncio
-from lm_client import LMClient
+from infermesh import LMClient
 
 async def main():
     async with LMClient(model="openai/gpt-4.1-mini", api_base="https://api.openai.com/v1") as client:
@@ -519,13 +519,13 @@ asyncio.run(main())
 
 ## Benchmarking
 
-`lm-client bench` measures client-side throughput across a sweep. It is
+`infermesh bench` measures client-side throughput across a sweep. It is
 intentionally a client benchmark: it helps you choose a good
 `max_parallel_requests` or embedding batch size for your workload, not the
 server's absolute maximum capacity.
 
 ```bash
-lm-client bench generate \
+infermesh bench generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --prompt "Write a haiku." \
@@ -549,4 +549,4 @@ spent waiting in the client queue before being sent. High `q_p95` relative to
 `svc_p95` means the client is the bottleneck, not the server.
 
 Use `--input-jsonl` to benchmark with a real prompt distribution instead of one
-repeated prompt. An embedding benchmark is available as `lm-client bench embed`.
+repeated prompt. An embedding benchmark is available as `infermesh bench embed`.

@@ -1,3 +1,3 @@
 # LMClient
 
-::: lm_client.LMClient
+::: infermesh.LMClient

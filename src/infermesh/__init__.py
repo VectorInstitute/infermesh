@@ -1,18 +1,18 @@
-"""lm_client — a researcher-first batching client built on LiteLLM.
+"""infermesh — a researcher-first batching client built on LiteLLM.
 
-`lm_client` wraps [LiteLLM](https://docs.litellm.ai) with the workflow pieces
+`infermesh` wraps [LiteLLM](https://docs.litellm.ai) with the workflow pieces
 that tend to show up once an experiment stops being "one request in, one string
 out": concurrent batch execution, notebook-safe sync calls, partial-failure
 handling, client-side throttling, and optional multi-replica routing. Public
 results are typed in both synchronous and asynchronous Python. Multimodal (VLM)
 inputs are supported via the standard OpenAI content-block format; use
-[image_block][lm_client.image_block] to encode local image files or raw bytes
+[image_block][infermesh.image_block] to encode local image files or raw bytes
 before sending. It supports two operating modes:
 
 **Single-endpoint mode** — one model, one server:
 
 ```python
-from lm_client import LMClient
+from infermesh import LMClient
 
 with LMClient(
     model="openai/gpt-4o-mini", api_base="http://localhost:8000/v1"
@@ -24,7 +24,7 @@ with LMClient(
 **Router mode** — multiple replicas with automatic load-balancing:
 
 ```python
-from lm_client import LMClient, DeploymentConfig
+from infermesh import LMClient, DeploymentConfig
 
 client = LMClient(
     deployments={
@@ -57,14 +57,14 @@ Advanced library integrations can still pass `api_key` directly when the
 secret comes from a secret manager or another in-process credential source.
 
 If you only need a small number of single requests, plain LiteLLM or the
-provider SDK is usually simpler. `lm_client` is most useful when you want to
+provider SDK is usually simpler. `infermesh` is most useful when you want to
 push larger workloads through a notebook, script, or local inference stack.
 
 **Async usage** — every public method has an `a`-prefixed async counterpart:
 
 ```python
 import asyncio
-from lm_client import LMClient
+from infermesh import LMClient
 
 
 async def main() -> None:
@@ -80,45 +80,45 @@ asyncio.run(main())
 
 **Public symbols:**
 
-- [LMClient][lm_client.LMClient] — main client; generation, embedding, and
+- [LMClient][infermesh.LMClient] — main client; generation, embedding, and
   transcription in both sync and async forms, with optional rate limiting and
   router mode.
-- [DeploymentConfig][lm_client.DeploymentConfig] — per-replica configuration
+- [DeploymentConfig][infermesh.DeploymentConfig] — per-replica configuration
   used in router mode.
-- [BatchResult][lm_client.BatchResult] — generic container returned by
+- [BatchResult][infermesh.BatchResult] — generic container returned by
   `*_batch` methods.
-- [GenerationResult][lm_client.GenerationResult] — typed result from a
+- [GenerationResult][infermesh.GenerationResult] — typed result from a
   text-generation call.
-- [EmbeddingResult][lm_client.EmbeddingResult] — typed result from an
+- [EmbeddingResult][infermesh.EmbeddingResult] — typed result from an
   embedding call.
-- [TranscriptionResult][lm_client.TranscriptionResult] — typed result from an
+- [TranscriptionResult][infermesh.TranscriptionResult] — typed result from an
   audio-transcription call.
-- [RateLimiter][lm_client.RateLimiter] — async token-bucket rate limiter;
-  created automatically by [LMClient][lm_client.LMClient] when `rpm` / `tpm`
+- [RateLimiter][infermesh.RateLimiter] — async token-bucket rate limiter;
+  created automatically by [LMClient][infermesh.LMClient] when `rpm` / `tpm`
   are supplied, but can also be used standalone.
-- [RateLimiterAcquisitionHandle][lm_client.RateLimiterAcquisitionHandle] —
-  opaque handle returned by [acquire][lm_client.RateLimiter.acquire]; passed
-  back to [adjust][lm_client.RateLimiter.adjust] after the request completes.
-- [TokenUsage][lm_client.TokenUsage] — token-count breakdown attached to
+- [RateLimiterAcquisitionHandle][infermesh.RateLimiterAcquisitionHandle] —
+  opaque handle returned by [acquire][infermesh.RateLimiter.acquire]; passed
+  back to [adjust][infermesh.RateLimiter.adjust] after the request completes.
+- [TokenUsage][infermesh.TokenUsage] — token-count breakdown attached to
   generation and embedding results.
-- [RequestMetrics][lm_client.RequestMetrics] — per-request timing and routing
+- [RequestMetrics][infermesh.RequestMetrics] — per-request timing and routing
   metadata.
-- [ToolCall][lm_client.ToolCall] — a structured tool-call emitted by a model
+- [ToolCall][infermesh.ToolCall] — a structured tool-call emitted by a model
   during generation.
-- [image_block][lm_client.image_block] — build an image content block from a
+- [image_block][infermesh.image_block] — build an image content block from a
   local file, raw bytes, or URL for multimodal (VLM) chat messages.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("lm-client")
+    __version__ = version("infermesh")
 except PackageNotFoundError:
     __version__ = "unknown"
 
-from lm_client.client import LMClient
-from lm_client.rate_limiter import RateLimiter, RateLimiterAcquisitionHandle
-from lm_client.types import (
+from infermesh.client import LMClient
+from infermesh.rate_limiter import RateLimiter, RateLimiterAcquisitionHandle
+from infermesh.types import (
     BatchResult,
     DeploymentConfig,
     EmbeddingResult,

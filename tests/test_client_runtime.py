@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from lm_client._utils import parse_model_output_with_format
-from lm_client.client import LMClient
-from lm_client.types import DeploymentConfig, image_block
+from infermesh._utils import parse_model_output_with_format
+from infermesh.client import LMClient
+from infermesh.types import DeploymentConfig, image_block
 from tests.fakes import (
     FakeLiteLLM,
     FakeRouter,
@@ -270,7 +270,7 @@ def test_generate_retries_on_transient_error(
     flaky = FlakyFakeLiteLLM(fail_count=2, error=error)
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: flaky)
     client = LMClient(model="openai/test", api_base="http://localhost", max_retries=3)
-    with patch("lm_client.client.asyncio.sleep", new_callable=AsyncMock):
+    with patch("infermesh.client.asyncio.sleep", new_callable=AsyncMock):
         result = client.generate("hi")
     assert result.metrics is not None
     assert result.metrics.retries == 2
@@ -286,7 +286,7 @@ def test_generate_raises_after_max_retries_exhausted(
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: flaky)
     client = LMClient(model="openai/test", api_base="http://localhost", max_retries=2)
     with (
-        patch("lm_client.client.asyncio.sleep", new_callable=AsyncMock),
+        patch("infermesh.client.asyncio.sleep", new_callable=AsyncMock),
         pytest.raises(FakeLiteLLM.ServiceUnavailableError),
     ):
         client.generate("hi")
@@ -347,7 +347,7 @@ def test_retry_after_header_sets_sleep_duration(
     async def capture_sleep(seconds: float) -> None:
         sleep_args.append(seconds)
 
-    with patch("lm_client.client.asyncio.sleep", capture_sleep):
+    with patch("infermesh.client.asyncio.sleep", capture_sleep):
         client.generate("hi")
     assert sleep_args == [7.0]
     client.close()

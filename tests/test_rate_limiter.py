@@ -7,7 +7,7 @@ from unittest import mock
 
 import pytest
 
-from lm_client.rate_limiter import (
+from infermesh.rate_limiter import (
     RateLimiter,
     RateLimiterAcquisitionHandle,
     _parse_rate_limit_info_from_response_headers,
@@ -27,8 +27,8 @@ MAX_TOKEN_BURST = 1_000
 @pytest.fixture
 def mock_time() -> Generator[MockTime, None, None]:
     mock_time_instance = MockTime()
-    module_path = "lm_client.rate_limiter"
-    bucket_module_path = "lm_client._bucket"
+    module_path = "infermesh.rate_limiter"
+    bucket_module_path = "infermesh._bucket"
     patches: list[mock._patch[Any]] = [
         mock.patch(f"{module_path}.time.monotonic", new=mock_time_instance.monotonic),
         mock.patch(

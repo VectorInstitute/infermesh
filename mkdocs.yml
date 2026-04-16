@@ -1,7 +1,7 @@
-site_name: lm-client
+site_name: infermesh
 site_description: Researcher-first LiteLLM client for batch LLM workloads
-repo_url: https://github.com/VectorInstitute/lm-client
-repo_name: VectorInstitute/lm-client
+repo_url: https://github.com/VectorInstitute/infermesh
+repo_name: VectorInstitute/infermesh
 
 theme:
   name: material

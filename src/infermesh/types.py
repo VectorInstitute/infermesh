@@ -1,7 +1,7 @@
-"""Shared public types for ``lm_client``.
+"""Shared public types for ``infermesh``.
 
-This module defines the typed public contract used by ``lm_client`` batch
-workflows. Every result returned by [LMClient][lm_client.LMClient] is an
+This module defines the typed public contract used by ``infermesh`` batch
+workflows. Every result returned by [LMClient][infermesh.LMClient] is an
 instance of one of the classes defined here.
 """
 
@@ -25,7 +25,7 @@ blocks instead of a plain string. Text blocks have the form
 ``{"type": "text", "text": "..."}``; image blocks use
 ``{"type": "image_url", "image_url": {"url": "https://..."}}``.
 
-Use [image_block][lm_client.image_block] to build image blocks from local files
+Use [image_block][infermesh.image_block] to build image blocks from local files
 or raw bytes.
 """
 
@@ -33,7 +33,7 @@ ChatInput: TypeAlias = list[ChatMessage]
 """A full chat conversation: an ordered list of `ChatMessage` dicts.
 
 Supports both plain-text and multimodal (VLM) messages; see `ChatMessage` and
-[image_block][lm_client.image_block].
+[image_block][infermesh.image_block].
 """
 
 ResponsesInput: TypeAlias = dict[str, Any]
@@ -48,7 +48,7 @@ GenerateInput: TypeAlias = str | ChatInput | ResponsesInput
 
 - ``str``: plain text; converted to a single user message internally.
 - `ChatInput`: a pre-built list of role/content dicts. Supports multimodal
-  messages; see `ChatMessage` and [image_block][lm_client.image_block].
+  messages; see `ChatMessage` and [image_block][infermesh.image_block].
 - `ResponsesInput`: a dict suitable for the ``responses`` endpoint.
 """
 
@@ -194,9 +194,9 @@ EndpointType: TypeAlias = Literal["text_completion", "chat_completion", "respons
 class DeploymentConfig:
     """Configuration for a single deployment replica used in router mode.
 
-    In router mode [LMClient][lm_client.LMClient] accepts a mapping of free-form
+    In router mode [LMClient][infermesh.LMClient] accepts a mapping of free-form
     labels (for example ``"gpu-0"`` or ``"us-east-1"``) to
-    [DeploymentConfig][lm_client.DeploymentConfig] instances. The client builds
+    [DeploymentConfig][infermesh.DeploymentConfig] instances. The client builds
     a LiteLLM Router from these configs and load-balances requests across the
     replicas.
 
@@ -221,7 +221,7 @@ class DeploymentConfig:
     --------
     Create a deployment for a local vLLM replica:
 
-    >>> from lm_client import DeploymentConfig
+    >>> from infermesh import DeploymentConfig
     >>> cfg = DeploymentConfig(
     ...     model="hosted_vllm/meta-llama/Meta-Llama-3-8B-Instruct",
     ...     api_base="http://gpu0:8000/v1",
@@ -340,8 +340,8 @@ class TokenUsage:
 class RequestMetrics:
     """Per-request timing and routing metadata.
 
-    Attached to every [GenerationResult][lm_client.GenerationResult], [EmbeddingResult][lm_client.EmbeddingResult],
-    and [TranscriptionResult][lm_client.TranscriptionResult] produced by [LMClient][lm_client.LMClient].
+    Attached to every [GenerationResult][infermesh.GenerationResult], [EmbeddingResult][infermesh.EmbeddingResult],
+    and [TranscriptionResult][infermesh.TranscriptionResult] produced by [LMClient][infermesh.LMClient].
 
     Parameters
     ----------
@@ -389,9 +389,9 @@ class RequestMetrics:
 class GenerationResult:
     """The typed result of a text-generation request.
 
-    Returned by [generate][lm_client.LMClient.generate],
-    [agenerate][lm_client.LMClient.agenerate], and contained in
-    [BatchResult][lm_client.BatchResult] for ``*_batch`` methods.
+    Returned by [generate][infermesh.LMClient.generate],
+    [agenerate][infermesh.LMClient.agenerate], and contained in
+    [BatchResult][infermesh.BatchResult] for ``*_batch`` methods.
 
     Parameters
     ----------
@@ -437,7 +437,7 @@ class GenerationResult:
     Notes
     -----
     ``str(result)`` returns `output_text`, so a
-    [GenerationResult][lm_client.GenerationResult] can be used directly wherever a string is
+    [GenerationResult][infermesh.GenerationResult] can be used directly wherever a string is
     expected.
 
     Examples
@@ -489,8 +489,8 @@ class GenerationResult:
 class EmbeddingResult:
     """The typed result of an embedding request.
 
-    Returned by [embed][lm_client.LMClient.embed] for single-string input and
-    contained in [BatchResult][lm_client.BatchResult] for [embed_batch][lm_client.LMClient.embed_batch]
+    Returned by [embed][infermesh.LMClient.embed] for single-string input and
+    contained in [BatchResult][infermesh.BatchResult] for [embed_batch][infermesh.LMClient.embed_batch]
     calls.
 
     Parameters
@@ -529,8 +529,8 @@ class EmbeddingResult:
 class TranscriptionResult:
     """The typed result of an audio-transcription request.
 
-    Returned by [transcribe][lm_client.LMClient.transcribe] and
-    [atranscribe][lm_client.LMClient.atranscribe].
+    Returned by [transcribe][infermesh.LMClient.transcribe] and
+    [atranscribe][infermesh.LMClient.atranscribe].
 
     Parameters
     ----------
@@ -574,10 +574,10 @@ T = TypeVar("T")
 class BatchResult(Generic[T]):
     """A typed container for the results of a batch request.
 
-    Returned by [generate_batch][lm_client.LMClient.generate_batch],
-    [agenerate_batch][lm_client.LMClient.agenerate_batch],
-    [embed_batch][lm_client.LMClient.embed_batch], and
-    [aembed_batch][lm_client.LMClient.aembed_batch].
+    Returned by [generate_batch][infermesh.LMClient.generate_batch],
+    [agenerate_batch][infermesh.LMClient.agenerate_batch],
+    [embed_batch][infermesh.LMClient.embed_batch], and
+    [aembed_batch][infermesh.LMClient.aembed_batch].
 
     When ``return_exceptions=True`` (the default), a failed item does **not**
     raise and discard the whole batch.  Instead, `results` contains

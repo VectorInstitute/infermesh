@@ -1,6 +1,6 @@
 """Async token-bucket rate limiter.
 
-[RateLimiter][lm_client.RateLimiter] enforces per-minute and per-day request
+[RateLimiter][infermesh.RateLimiter] enforces per-minute and per-day request
 and token limits across both synchronous (via `SyncRunner`) and async call
 paths.  Unlike asyncio-native alternatives, its counters are protected by a
 `threading.Lock`, so a single instance can be shared safely between the
@@ -8,10 +8,10 @@ caller's event loop and the `SyncRunner`'s background loop.
 
 The limiter exposes two operations:
 
-- [acquire][lm_client.RateLimiter.acquire] — called before a request is
+- [acquire][infermesh.RateLimiter.acquire] — called before a request is
   dispatched.  Blocks asynchronously until all configured buckets have
   capacity, then atomically deducts the estimated token cost.
-- [adjust][lm_client.RateLimiter.adjust] — called after the response arrives.
+- [adjust][infermesh.RateLimiter.adjust] — called after the response arrives.
   Corrects for estimation error, refunds tokens on failure, and optionally
   syncs the buckets from `x-ratelimit-*` response headers.
 """
@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from lm_client._bucket import Bucket
+from infermesh._bucket import Bucket
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,9 @@ _RESET_TIME_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)", re.IGNORECASE)
 
 @dataclass(slots=True)
 class RateLimiterAcquisitionHandle:
-    """Opaque handle returned by [acquire][lm_client.RateLimiter.acquire].
+    """Opaque handle returned by [acquire][infermesh.RateLimiter.acquire].
 
-    Pass this handle to [adjust][lm_client.RateLimiter.adjust] after the
+    Pass this handle to [adjust][infermesh.RateLimiter.adjust] after the
     request completes so the limiter can reconcile the actual token usage
     against the pre-dispatch estimate and release or reclaim the difference.
 
@@ -46,14 +46,14 @@ class RateLimiterAcquisitionHandle:
     ----------
     estimated_tokens : int
         The number of tokens that were reserved when the handle was created.
-        This field is used internally by [adjust][lm_client.RateLimiter.adjust];
+        This field is used internally by [adjust][infermesh.RateLimiter.adjust];
         external callers generally do not need to inspect it.
 
     Notes
     -----
-    Do not create [RateLimiterAcquisitionHandle][lm_client.RateLimiterAcquisitionHandle]
+    Do not create [RateLimiterAcquisitionHandle][infermesh.RateLimiterAcquisitionHandle]
     instances directly.  They are produced exclusively by
-    [acquire][lm_client.RateLimiter.acquire] and should be treated as opaque
+    [acquire][infermesh.RateLimiter.acquire] and should be treated as opaque
     tokens.
     """
 
@@ -75,7 +75,7 @@ class RateLimiter:
     which prevents large requests from being starved by a constant stream of
     small ones.
 
-    After a provider response arrives, [adjust][lm_client.RateLimiter.adjust]
+    After a provider response arrives, [adjust][infermesh.RateLimiter.adjust]
     refines the token accounting with the actual usage and can also sync the
     bucket state from the `x-ratelimit-*` headers returned by OpenAI-compatible
     APIs.
@@ -120,7 +120,7 @@ class RateLimiter:
     --------
     A simple 100 RPM limiter:
 
-    >>> from lm_client import RateLimiter
+    >>> from infermesh import RateLimiter
     >>> limiter = RateLimiter(requests_per_minute=100)
 
     A combined 500 RPM / 100 000 TPM limiter appropriate for OpenAI Tier-2:
@@ -205,10 +205,10 @@ class RateLimiter:
         Blocks asynchronously until *all* active buckets (RPM, TPM, RPD, TPD)
         have enough capacity for the request.  Once capacity is available,
         the tokens are atomically deducted and a
-        [RateLimiterAcquisitionHandle][lm_client.RateLimiterAcquisitionHandle]
+        [RateLimiterAcquisitionHandle][infermesh.RateLimiterAcquisitionHandle]
         is returned.
 
-        Call [adjust][lm_client.RateLimiter.adjust] with the returned handle
+        Call [adjust][infermesh.RateLimiter.adjust] with the returned handle
         after the request completes to reconcile actual token usage.
 
         Parameters
@@ -300,13 +300,13 @@ class RateLimiter:
     ) -> None:
         """Reconcile a reservation with the actual outcome of the request.
 
-        This method must be called after every [acquire][lm_client.RateLimiter.acquire]
+        This method must be called after every [acquire][infermesh.RateLimiter.acquire]
         call, regardless of whether the request succeeded or failed.  It
         performs three tasks:
 
         1. **Failure refund** — when ``actual_tokens == 0`` (signalling a
            failed request), the one request slot that was deducted by
-           [acquire][lm_client.RateLimiter.acquire] is returned to the RPM
+           [acquire][infermesh.RateLimiter.acquire] is returned to the RPM
            bucket so the failed request does not count against the rate.
         2. **Token correction** — the difference between the pre-dispatch
            estimate (``handle.estimated_tokens``) and the actual usage is
@@ -319,7 +319,7 @@ class RateLimiter:
         Parameters
         ----------
         handle : RateLimiterAcquisitionHandle
-            The handle returned by the preceding [acquire][lm_client.RateLimiter.acquire]
+            The handle returned by the preceding [acquire][infermesh.RateLimiter.acquire]
             call.
         actual_tokens : int
             Total tokens actually consumed, as reported in the response's

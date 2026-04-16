@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from lm_client import cli
+from infermesh import cli
 from tests.fakes import FakeCLIClient
 
 _BASE_ARGS = [

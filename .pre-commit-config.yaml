@@ -6,7 +6,7 @@ repos:
       - id: check-ast
       - id: check-builtin-literals
       - id: check-docstring-first
-        exclude: ^src/lm_client/types\.py$
+        exclude: ^src/infermesh/types\.py$
       - id: debug-statements
       - id: end-of-file-fixer
       - id: mixed-line-ending
@@ -25,6 +25,6 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: uv run mypy src/lm_client tests
+        entry: uv run mypy src/infermesh tests
         language: system
         pass_filenames: false

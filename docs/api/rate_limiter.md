@@ -1,5 +1,5 @@
 # Rate Limiter
 
-::: lm_client.RateLimiter
+::: infermesh.RateLimiter
 
-::: lm_client.RateLimiterAcquisitionHandle
+::: infermesh.RateLimiterAcquisitionHandle

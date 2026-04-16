@@ -6,7 +6,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone <repo-url>
-cd lm-client
+cd infermesh
 uv sync --group dev
 uv run pre-commit install
 ```
@@ -22,7 +22,7 @@ uv run pytest -k "batch"              # filter by name
 ## Type checking
 
 ```bash
-uv run mypy src/lm_client tests
+uv run mypy src/infermesh tests
 ```
 
 ## Linting and formatting

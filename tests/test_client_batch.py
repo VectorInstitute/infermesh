@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from lm_client.client import LMClient
+from infermesh.client import LMClient
 from tests.fakes import FakeLiteLLM
 
 

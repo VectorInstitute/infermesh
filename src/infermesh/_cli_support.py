@@ -1,4 +1,4 @@
-"""Private support helpers for ``lm_client.cli``."""
+"""Private support helpers for ``infermesh.cli``."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast, overload
 
-from lm_client.client import LMClient
-from lm_client.types import DeploymentConfig, EndpointType
+from infermesh.client import LMClient
+from infermesh.types import DeploymentConfig, EndpointType
 
 
 @dataclass

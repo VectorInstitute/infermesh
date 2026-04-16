@@ -1,7 +1,7 @@
 """Notebook-safe synchronous wrapper for async coroutines.
 
 `SyncRunner` runs coroutines on a dedicated background event-loop
-thread, which makes the synchronous wrappers in [LMClient][lm_client.LMClient]
+thread, which makes the synchronous wrappers in [LMClient][infermesh.LMClient]
 safe to call from notebook environments that already have a running event loop
 (e.g. Jupyter, IPython).  Using `asyncio.run_until_complete` on the caller's
 thread would raise a `RuntimeError` in those contexts; submitting work to a
@@ -40,7 +40,7 @@ class SyncRunner:
 
     Examples
     --------
-    Typical usage (via [LMClient][lm_client.LMClient]; you do not need to
+    Typical usage (via [LMClient][infermesh.LMClient]; you do not need to
     instantiate `SyncRunner` directly):
 
     >>> runner = SyncRunner()
@@ -57,7 +57,7 @@ class SyncRunner:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop,
-            name="lm-client-sync-runner",
+            name="infermesh-sync-runner",
             daemon=True,
         )
         self._started = threading.Event()

@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from lm_client._utils import normalize_transcription_input
-from lm_client.client import DEFAULT_MAX_TRANSCRIPTION_BYTES, LMClient
-from lm_client.rate_limiter import RateLimiterAcquisitionHandle
+from infermesh._utils import normalize_transcription_input
+from infermesh.client import DEFAULT_MAX_TRANSCRIPTION_BYTES, LMClient
+from infermesh.rate_limiter import RateLimiterAcquisitionHandle
 from tests.fakes import FakeLiteLLM
 
 
@@ -30,7 +30,7 @@ async def test_rate_limiter_adjust_receives_headers(
         calls.append((actual_tokens, response_headers))
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.adjust", fake_adjust)
+    monkeypatch.setattr("infermesh.client.RateLimiter.adjust", fake_adjust)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -104,7 +104,7 @@ async def test_cancelled_rate_limiter_wait_does_not_dispatch(
         return {}, None
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
     monkeypatch.setattr(LMClient, "_call_generation", fake_call_generation)
     client = LMClient(model="openai/test", api_base="http://localhost", rpm=10)
     with pytest.raises(asyncio.CancelledError):
@@ -124,7 +124,7 @@ async def test_default_output_tokens_used_when_no_max_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -148,7 +148,7 @@ async def test_per_request_max_tokens_overrides_default_output_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -172,7 +172,7 @@ async def test_default_request_kwargs_max_tokens_overrides_default_output_tokens
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -197,7 +197,7 @@ async def test_responses_max_output_tokens_overrides_default_output_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("lm_client.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -254,7 +254,7 @@ def test_http_api_base_emits_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    with caplog.at_level(logging.WARNING, logger="lm_client.client"):
+    with caplog.at_level(logging.WARNING, logger="infermesh.client"):
         client = LMClient(model="openai/test", api_base="http://remote-server:8000/v1")
     assert "unencrypted" in caplog.text
     client.close()
@@ -271,7 +271,7 @@ def test_http_localhost_no_warning(
         "http://[::1]:8000/v1",
     ):
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="lm_client.client"):
+        with caplog.at_level(logging.WARNING, logger="infermesh.client"):
             client = LMClient(model="openai/test", api_base=api_base)
         assert "unencrypted" not in caplog.text
         client.close()

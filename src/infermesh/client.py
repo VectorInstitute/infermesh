@@ -1,6 +1,6 @@
 """Public ``LMClient`` interface built on top of LiteLLM.
 
-The single public class in this module, [LMClient][lm_client.LMClient], wraps
+The single public class in this module, [LMClient][infermesh.LMClient], wraps
 LiteLLM to provide typed generation, embedding, and transcription calls for
 batch-heavy workflows. Every public method has both a synchronous form and an
 ``a``-prefixed async counterpart that can be awaited directly. The synchronous
@@ -10,7 +10,7 @@ event loop.
 
 Examples
 --------
->>> from lm_client import LMClient
+>>> from infermesh import LMClient
 >>> with LMClient(
 ...     model="openai/gpt-4o-mini",
 ...     api_base="https://api.openai.com/v1",
@@ -37,8 +37,8 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 
-from lm_client._client_runtime import _ClientRuntimeMixin
-from lm_client._utils import (
+from infermesh._client_runtime import _ClientRuntimeMixin
+from infermesh._utils import (
     build_embedding_results,
     build_generation_result,
     build_transcription_result,
@@ -48,8 +48,8 @@ from lm_client._utils import (
     normalize_generate_input,
     normalize_transcription_input,
 )
-from lm_client.rate_limiter import RateLimiter as _RateLimiter
-from lm_client.types import (
+from infermesh.rate_limiter import RateLimiter as _RateLimiter
+from infermesh.types import (
     BatchResult,
     DeploymentConfig,
     EmbeddingBatchResult,
@@ -73,7 +73,7 @@ RateLimiter = _RateLimiter
 class LMClient(_ClientRuntimeMixin):
     """Batch-friendly language-model interface built on LiteLLM.
 
-    [LMClient][lm_client.LMClient] supports two operating modes selected at construction
+    [LMClient][infermesh.LMClient] supports two operating modes selected at construction
     time:
 
     **Single-endpoint mode** — one model, one server.  Provide ``model`` and
@@ -91,7 +91,7 @@ class LMClient(_ClientRuntimeMixin):
 
     **Router mode** — multiple replicas, load-balanced by a LiteLLM Router.
     Provide ``model`` (the logical model name) and ``deployments`` (a dict of
-    free-form label → [DeploymentConfig][lm_client.DeploymentConfig]):
+    free-form label → [DeploymentConfig][infermesh.DeploymentConfig]):
 
     ```python
     client = LMClient(
@@ -110,12 +110,12 @@ class LMClient(_ClientRuntimeMixin):
     ```
 
     If you only need a few single requests, plain LiteLLM or the provider SDK
-    is usually simpler. [LMClient][lm_client.LMClient] becomes useful when you
+    is usually simpler. [LMClient][infermesh.LMClient] becomes useful when you
     need concurrent batches, per-item failure handling, client-side rate
     limiting, or routing across several replicas of the same logical model.
 
     The client can be used as a context manager (sync or async) to ensure
-    [close][lm_client.LMClient.close] is always called:
+    [close][infermesh.LMClient.close] is always called:
 
     ```python
     with LMClient(
@@ -130,21 +130,21 @@ class LMClient(_ClientRuntimeMixin):
 
     Notes
     -----
-    Always call [close][lm_client.LMClient.close] (or use the context-manager form)
-    when the client is no longer needed. [close][lm_client.LMClient.close] stops
+    Always call [close][infermesh.LMClient.close] (or use the context-manager form)
+    when the client is no longer needed. [close][infermesh.LMClient.close] stops
     the background `SyncRunner` thread; failing to call it leaves a daemon thread
     running until process exit.
 
-    A single [RateLimiter][lm_client.RateLimiter] instance is shared between
+    A single [RateLimiter][infermesh.RateLimiter] instance is shared between
     the caller's event loop and the `SyncRunner` background loop, so sync and
     async calls are accounted together and do not double the effective rate.
 
     See Also
     --------
-    [DeploymentConfig][lm_client.DeploymentConfig] : Per-replica configuration
+    [DeploymentConfig][infermesh.DeploymentConfig] : Per-replica configuration
     for router mode.
 
-    [RateLimiter][lm_client.RateLimiter] : The rate-limiter used internally;
+    [RateLimiter][infermesh.RateLimiter] : The rate-limiter used internally;
     can also be used standalone.
     """
 
@@ -328,7 +328,7 @@ class LMClient(_ClientRuntimeMixin):
         """Release background resources used by the synchronous API.
 
         ``generate``, ``embed``, and ``transcribe`` run on a managed background
-        event loop. Call [close][lm_client.LMClient.close] when you are finished
+        event loop. Call [close][infermesh.LMClient.close] when you are finished
         with the client, or prefer ``with`` / ``async with`` so cleanup happens
         automatically.
         """

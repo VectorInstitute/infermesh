@@ -1,6 +1,6 @@
-# lm-client
+# infermesh
 
-`lm-client` is for researchers and engineers who need to run large LLM jobs
+`infermesh` is for researchers and engineers who need to run large LLM jobs
 from notebooks, scripts, or local inference stacks without rebuilding the same
 concurrency and quota-control layer each time.
 
@@ -17,7 +17,7 @@ experiment becomes real work:
 - multi-replica routing for local or clustered inference endpoints
 
 If you only need a handful of one-off requests, use the provider SDK or plain
-LiteLLM. `lm-client` earns its keep when throughput control and batch ergonomics
+LiteLLM. `infermesh` earns its keep when throughput control and batch ergonomics
 matter more than raw minimalism.
 
 ## Install
@@ -25,17 +25,17 @@ matter more than raw minimalism.
 Python `3.12+` is required.
 
 ```bash
-python -m pip install lm-client
+python -m pip install infermesh
 ```
 
 If you use `uv`:
 
 ```bash
-uv add lm-client
+uv add infermesh
 ```
 
 Contributor setup, editable installs, and clone-based workflows live in
-[CONTRIBUTING.md](https://github.com/VectorInstitute/lm-client/blob/main/CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/VectorInstitute/infermesh/blob/main/CONTRIBUTING.md).
 
 ## Quick Start
 
@@ -49,7 +49,7 @@ The core workflow is "run a batch, keep the results you want, inspect the failur
 and retry only what broke":
 
 ```python
-from lm_client import LMClient
+from infermesh import LMClient
 
 prompts = [
     "Summarize section 1 in two bullet points.",
@@ -149,7 +149,7 @@ print(result.duration_s)   # audio length in seconds
 export OPENAI_API_KEY=sk-...
 
 # Generate — single prompt
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --prompt "Hello"
@@ -157,14 +157,14 @@ lm-client generate \
 # Generate — from a JSONL file, results to another JSONL file
 # Each input line: {"prompt": "..."} or {"messages": [...]} or {"responses_input": "..."}
 # Output includes an _index field so interrupted runs can be resumed.
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
 # Resume an interrupted run — skips already-completed rows and appends new ones
-lm-client generate \
+infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
@@ -172,13 +172,13 @@ lm-client generate \
   --resume
 
 # Create embeddings
-lm-client embed \
+infermesh embed \
   --model text-embedding-3-small \
   --api-base https://api.openai.com/v1 \
   --text "hello world"
 
 # Transcribe audio
-lm-client transcribe --model whisper-1 \
+infermesh transcribe --model whisper-1 \
   --api-base https://api.openai.com/v1 \
   recording.wav
 ```
@@ -194,7 +194,7 @@ moment — everything already completed is safe on disk.
 
 ```python
 import json
-from lm_client import LMClient
+from infermesh import LMClient
 
 with open("results.jsonl", "w") as out, \
      LMClient(model="openai/gpt-4.1-mini") as client:
@@ -255,7 +255,7 @@ to spread load across them. `model` is the logical name the router exposes; each
 `DeploymentConfig.model` is the backend string sent to that server.
 
 ```python
-from lm_client import DeploymentConfig, LMClient
+from infermesh import DeploymentConfig, LMClient
 
 client = LMClient(
     model="llama-3-8b",
@@ -286,7 +286,7 @@ structured config. Deployment keys (`"gpu-0"` etc.) are free-form labels.
 **CLI — repeated `--api-base` flags:**
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model llama-3-8b \
   --api-base http://host1:8000/v1 \
   --api-base http://host2:8000/v1 \
@@ -308,7 +308,7 @@ api_base = "http://host2:8000/v1"
 ```
 
 ```bash
-lm-client generate \
+infermesh generate \
   --model llama-3-8b \
   --deployments-toml deployments.toml \
   --prompt "Hello"
@@ -327,7 +327,7 @@ manage the event loop yourself.
 
 ```python
 import asyncio
-from lm_client import LMClient
+from infermesh import LMClient
 
 async def main():
     async with LMClient(model="openai/gpt-4.1-mini") as client:
@@ -431,12 +431,12 @@ client = LMClient(
 <details>
 <summary>Benchmarking</summary>
 
-`lm-client bench` measures client-side throughput across a concurrency sweep. It is
+`infermesh bench` measures client-side throughput across a concurrency sweep. It is
 intentionally a **client** benchmark — it tells you the best `max_parallel_requests`
 setting for your workload, not the server's maximum capacity.
 
 ```bash
-lm-client bench generate \
+infermesh bench generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --prompt "Write a haiku." \
@@ -458,7 +458,7 @@ recommended_max_parallel_requests=8
 High `q_p95` relative to `svc_p95` means the client is the bottleneck, not the server.
 
 Use `--input-jsonl` to benchmark with a real prompt distribution. An embedding
-benchmark is available as `lm-client bench embed`.
+benchmark is available as `infermesh bench embed`.
 
 For server-centric metrics (TTFT, TPOT, ITL, request goodput), use a dedicated server
 benchmark:
@@ -472,15 +472,15 @@ benchmark:
 
 Use LiteLLM directly if provider abstraction is the only missing piece.
 
-`lm-client` is intentionally narrower:
+`infermesh` is intentionally narrower:
 
 - LiteLLM is the provider abstraction and request layer.
-- `lm-client` adds notebook-safe sync APIs and concurrent batch helpers.
-- `lm-client` preserves partial failures instead of turning a long run into one
+- `infermesh` adds notebook-safe sync APIs and concurrent batch helpers.
+- `infermesh` preserves partial failures instead of turning a long run into one
   giant exception.
-- `lm-client` adds client-side throttling and replica routing for experiment
+- `infermesh` adds client-side throttling and replica routing for experiment
   workloads.
-- `lm-client` returns typed result objects so request metadata is easier to
+- `infermesh` returns typed result objects so request metadata is easier to
   inspect programmatically.
 
 ## When Not To Use It

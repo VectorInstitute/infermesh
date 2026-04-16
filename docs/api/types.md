@@ -2,44 +2,44 @@
 
 ## image_block
 
-::: lm_client.image_block
+::: infermesh.image_block
 
 ## Input Types
 
-::: lm_client.types.ChatMessage
+::: infermesh.types.ChatMessage
 
-::: lm_client.types.ChatInput
+::: infermesh.types.ChatInput
 
-::: lm_client.types.ResponsesInput
+::: infermesh.types.ResponsesInput
 
-::: lm_client.types.GenerateInput
+::: infermesh.types.GenerateInput
 
-::: lm_client.types.EmbeddingInput
+::: infermesh.types.EmbeddingInput
 
-::: lm_client.types.TranscriptionInput
+::: infermesh.types.TranscriptionInput
 
-::: lm_client.types.EndpointType
+::: infermesh.types.EndpointType
 
 ## Result Types
 
-::: lm_client.GenerationResult
+::: infermesh.GenerationResult
 
-::: lm_client.EmbeddingResult
+::: infermesh.EmbeddingResult
 
-::: lm_client.TranscriptionResult
+::: infermesh.TranscriptionResult
 
-::: lm_client.BatchResult
+::: infermesh.BatchResult
 
-::: lm_client.TokenUsage
+::: infermesh.TokenUsage
 
-::: lm_client.RequestMetrics
+::: infermesh.RequestMetrics
 
-::: lm_client.ToolCall
+::: infermesh.ToolCall
 
-::: lm_client.DeploymentConfig
+::: infermesh.DeploymentConfig
 
 ## Batch Aliases
 
-::: lm_client.types.GenerationBatchResult
+::: infermesh.types.GenerationBatchResult
 
-::: lm_client.types.EmbeddingBatchResult
+::: infermesh.types.EmbeddingBatchResult

@@ -1,4 +1,4 @@
-"""Private benchmark helpers for ``lm_client.cli``."""
+"""Private benchmark helpers for ``infermesh.cli``."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from typing import Any
 
 from tqdm import tqdm
 
-from lm_client._cli_support import ClientConfig
-from lm_client._utils import batched_cycle, percentile
-from lm_client.types import BatchResult, EmbeddingResult
+from infermesh._cli_support import ClientConfig
+from infermesh._utils import batched_cycle, percentile
+from infermesh.types import BatchResult, EmbeddingResult
 
 DEFAULT_SWEEP = [1, 2, 4, 8, 16, 32]
 DEFAULT_EMBED_BATCH_SIZES = [1, 8, 32, 128, 512]

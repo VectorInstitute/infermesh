@@ -6,8 +6,8 @@ the rate window progresses.  The bucket also supports synchronisation from
 server-side `x-ratelimit-*` response headers so that the local estimate stays
 aligned with the provider's authoritative view.
 
-This module is internal to `lm_client`; external callers should interact with
-[RateLimiter][lm_client.RateLimiter] instead.
+This module is internal to `infermesh`; external callers should interact with
+[RateLimiter][infermesh.RateLimiter] instead.
 """
 
 from __future__ import annotations
@@ -289,7 +289,7 @@ class Bucket:
         for up to `SYNC_RATE_VALIDITY_DURATION` seconds.
 
         This method is called automatically by
-        [adjust][lm_client.RateLimiter.adjust] when `x-ratelimit-*` response
+        [adjust][infermesh.RateLimiter.adjust] when `x-ratelimit-*` response
         headers are present.
 
         Parameters

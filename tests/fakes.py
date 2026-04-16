@@ -6,9 +6,9 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
-from lm_client import cli
-from lm_client.client import LMClient
-from lm_client.types import (
+from infermesh import cli
+from infermesh.client import LMClient
+from infermesh.types import (
     BatchResult,
     EmbeddingResult,
     GenerationResult,

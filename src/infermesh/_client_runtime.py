@@ -12,21 +12,21 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
-from lm_client._utils import (
+from infermesh._utils import (
     extract_deployment_label,
     extract_response_headers,
     validate_endpoint,
 )
-from lm_client.rate_limiter import RateLimiter, RateLimiterAcquisitionHandle
-from lm_client.sync_runner import SyncRunner
-from lm_client.types import (
+from infermesh.rate_limiter import RateLimiter, RateLimiterAcquisitionHandle
+from infermesh.sync_runner import SyncRunner
+from infermesh.types import (
     DeploymentConfig,
     EndpointType,
     RequestMetrics,
     ResponsesInput,
 )
 
-logger = logging.getLogger("lm_client.client")
+logger = logging.getLogger("infermesh.client")
 
 _RoutingStrategy = Literal[
     "simple-shuffle",

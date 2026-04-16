@@ -1,5 +1,5 @@
 [project]
-name = "lm-client"
+name = "infermesh"
 version = "0.1.0"
 description = "Run large LLM batches from notebooks and scripts without rewriting concurrency or rate-limit glue."
 readme = "README.md"
@@ -46,7 +46,7 @@ dev = [
 ]
 
 [project.scripts]
-lm-client = "lm_client.cli:main"
+infermesh = "infermesh.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.9.0"]
@@ -54,7 +54,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = "src"
-module-name = "lm_client"
+module-name = "infermesh"
 
 [tool.ruff]
 line-length = 88
@@ -113,7 +113,7 @@ warn_unused_configs = true
 exclude = ["^\\.venv/"]
 
 [[tool.mypy.overrides]]
-module = ["lm_client.*"]
+module = ["infermesh.*"]
 strict = true
 
 [[tool.mypy.overrides]]
@@ -132,7 +132,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["lm_client"]
+source = ["infermesh"]
 branch = true
 
 [tool.coverage.report]
