@@ -1,0 +1,146 @@
+[project]
+name = "lm-client"
+version = "0.1.0"
+description = "Run large LLM batches from notebooks and scripts without rewriting concurrency or rate-limit glue."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Franklin Ogidi", email = "franklin.ogidi@vectorinstitute.ai" },
+]
+keywords = ["llm", "litellm", "async", "rate-limiting", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.0.0",
+    "litellm>=1.83.0",
+    "pydantic>=2.13.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.0.0",
+]
+
+[dependency-groups]
+docs = [
+    "mkdocs-include-markdown-plugin>=7.0.0",
+    "mkdocs-material>=9.0.0",
+    "mkdocstrings[python]>=0.27.0",
+]
+dev = [
+    "mypy>=1.20.0",
+    "pip-audit>=2.10.0",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.15.10",
+    "types-jsonschema",
+    "types-tqdm",
+]
+
+[project.scripts]
+lm-client = "lm_client.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = "lm_client"
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+exclude = [".venv", ".uv-cache"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+quote-style = "double"
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "B",
+    "D",
+    "E",
+    "ERA",
+    "F",
+    "I",
+    "N",
+    "PL",
+    "Q",
+    "RET",
+    "RSE",
+    "SIM",
+    "UP",
+    "W",
+]
+ignore = [
+    "D203",
+    "D213",
+    "D202",
+    "E501",
+    "PLR0913",
+    "PLR2004",
+    "PLC0415",
+    "UP040",
+    "UP046",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "PLR2004"]
+
+[tool.mypy]
+python_version = "3.12"
+pretty = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+exclude = ["^\\.venv/"]
+
+[[tool.mypy.overrides]]
+module = ["lm_client.*"]
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+check_untyped_defs = true
+disallow_incomplete_defs = false
+disallow_subclassing_any = false
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+disallow_untyped_defs = false
+no_implicit_optional = true
+warn_return_any = false
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["lm_client"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+]

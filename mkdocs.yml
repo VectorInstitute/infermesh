@@ -1,0 +1,57 @@
+site_name: lm-client
+site_description: Researcher-first LiteLLM client for batch LLM workloads
+repo_url: https://github.com/VectorInstitute/lm-client
+repo_name: VectorInstitute/lm-client
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+
+plugins:
+  - search
+  - include-markdown
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+            show_if_no_docstring: false
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - admonition
+  - pymdownx.details
+
+nav:
+  - Home: index.md
+  - User Guide: guide.md
+  - API Reference:
+    - LMClient: api/client.md
+    - Types & Helpers: api/types.md
+    - Rate Limiter: api/rate_limiter.md
