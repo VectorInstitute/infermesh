@@ -576,8 +576,10 @@ class BatchResult(Generic[T]):
 
     Returned by [generate_batch][infermesh.LMClient.generate_batch],
     [agenerate_batch][infermesh.LMClient.agenerate_batch],
-    [embed_batch][infermesh.LMClient.embed_batch], and
-    [aembed_batch][infermesh.LMClient.aembed_batch].
+    [embed_batch][infermesh.LMClient.embed_batch],
+    [aembed_batch][infermesh.LMClient.aembed_batch],
+    [transcribe_batch][infermesh.LMClient.transcribe_batch], and
+    [atranscribe_batch][infermesh.LMClient.atranscribe_batch].
 
     When ``return_exceptions=True`` (the default), a failed item does **not**
     raise and discard the whole batch.  Instead, `results` contains
@@ -673,12 +675,22 @@ GenerationBatchResult: TypeAlias = BatchResult[GenerationResult]
 EmbeddingBatchResult: TypeAlias = BatchResult[EmbeddingResult]
 """Type alias for a batch of embedding results."""
 
-OnGenerationResult: TypeAlias = (
-    Callable[[int, GenerationResult | None, BaseException | None], None] | None
-)
-"""Callback type for per-result notifications in batch generation.
+TranscriptionBatchResult: TypeAlias = BatchResult[TranscriptionResult]
+"""Type alias for a batch of transcription results."""
+
+OnBatchResult: TypeAlias = Callable[[int, T | None, BaseException | None], None] | None
+"""Generic callback type for per-result notifications in batch methods.
 
 Called as ``on_result(index, result, error)`` each time a single request
 settles.  ``index`` is the position in ``input_batch``; exactly one of
 ``result`` or ``error`` is ``None``.
 """
+
+OnGenerationResult: TypeAlias = OnBatchResult[GenerationResult]
+"""Callback type for per-result notifications in batch generation."""
+
+OnEmbeddingResult: TypeAlias = OnBatchResult[EmbeddingResult]
+"""Callback type for per-result notifications in embedding batches."""
+
+OnTranscriptionResult: TypeAlias = OnBatchResult[TranscriptionResult]
+"""Callback type for per-result notifications in transcription batches."""
