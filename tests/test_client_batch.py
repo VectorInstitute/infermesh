@@ -229,14 +229,17 @@ async def test_batch_result_length_parity(failing_fake_client: LMClient) -> None
 
 
 @pytest.mark.asyncio
-async def test_aembed_batch_on_failure_all_items_get_same_error(
+async def test_aembed_batch_recursively_isolates_bad_items(
     failing_fake_client: LMClient,
 ) -> None:
-    result = await failing_fake_client.aembed_batch(["good", "bad"])
+    result = await failing_fake_client.aembed_batch(["good-a", "bad", "good-b"])
     assert result.errors is not None
-    assert all(item is None for item in result.results)
-    assert all(isinstance(error, RuntimeError) for error in result.errors)
-    assert result.errors[0] is result.errors[1]
+    assert result.results[0] is not None
+    assert result.results[1] is None
+    assert result.results[2] is not None
+    assert isinstance(result.errors[1], RuntimeError)
+    assert result.errors[0] is None
+    assert result.errors[2] is None
 
 
 @pytest.mark.asyncio
@@ -245,6 +248,288 @@ async def test_aembed_batch_return_exceptions_false_raises(
 ) -> None:
     with pytest.raises(RuntimeError, match="Simulated failure"):
         await failing_fake_client.aembed_batch(["good", "bad"], return_exceptions=False)
+
+
+@pytest.mark.asyncio
+async def test_aembed_batch_callbacks_are_per_item(
+    fake_client: LMClient,
+) -> None:
+    progress_calls: list[tuple[int, int]] = []
+    result_calls: list[tuple[int, Any, Any]] = []
+
+    batch = await fake_client.aembed_batch(
+        ["a", "b", "c"],
+        micro_batch_size=2,
+        on_progress=lambda done, total: progress_calls.append((done, total)),
+        on_result=lambda index, result, error: result_calls.append(
+            (index, result, error)
+        ),
+    )
+
+    assert len(batch.results) == 3
+    assert len(progress_calls) == 3
+    assert progress_calls[-1] == (3, 3)
+    assert len(result_calls) == 3
+    assert sorted(index for index, _, _ in result_calls) == [0, 1, 2]
+    assert all(error is None for _, _, error in result_calls)
+
+
+@pytest.mark.asyncio
+async def test_aembed_batch_strict_mode_cancels_siblings_and_skips_queued_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[str] = []
+    cancelled: list[str] = []
+
+    class StrictEmbeddingFakeLiteLLM(FakeLiteLLM):
+        async def aembedding(self, **kwargs: Any) -> dict[str, Any]:
+            content = kwargs["input"][0]
+            seen.append(content)
+            if content == "bad":
+                await asyncio.sleep(0)
+                raise RuntimeError("boom")
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                cancelled.append(content)
+                raise
+            return await super().aembedding(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: StrictEmbeddingFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.aembed_batch(
+            ["slow", "bad", "queued"],
+            micro_batch_size=1,
+            return_exceptions=False,
+        )
+
+    assert "queued" not in seen
+    assert sorted(seen) == ["bad", "slow"]
+    assert cancelled == ["slow"]
+    client.close()
+
+
+def test_embed_batch_rejects_invalid_micro_batch_size(fake_client: LMClient) -> None:
+    with pytest.raises(ValueError, match="micro_batch_size"):
+        fake_client.embed_batch(["a"], micro_batch_size=0)
+    fake_client.close()
+
+
+@pytest.mark.asyncio
+async def test_atranscribe_batch_captures_per_item_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs["file"] == b"bad":
+                raise RuntimeError("transcription boom")
+            return await super().atranscription(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: FailingTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    batch = await client.atranscribe_batch([b"good", b"bad"])
+
+    assert batch.errors is not None
+    assert batch.results[0] is not None
+    assert batch.results[1] is None
+    assert isinstance(batch.errors[1], RuntimeError)
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_atranscribe_batch_return_exceptions_false_cancels_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[bytes] = []
+    cancelled: list[bytes] = []
+
+    class StrictTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["file"]
+            assert isinstance(payload, bytes)
+            seen.append(payload)
+            if payload == b"bad":
+                await asyncio.sleep(0)
+                raise RuntimeError("boom")
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                cancelled.append(payload)
+                raise
+            return await super().atranscription(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: StrictTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.atranscribe_batch(
+            [b"slow", b"bad", b"queued"],
+            return_exceptions=False,
+        )
+
+    assert b"queued" not in seen
+    assert sorted(seen) == [b"bad", b"slow"]
+    assert cancelled == [b"slow"]
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_atranscribe_batch_normalizes_inputs_lazily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    normalized: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    def fake_normalize(
+        input_data: Any,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[str, bytes]:
+        assert max_bytes is None
+        assert isinstance(input_data, str)
+        normalized.append(input_data)
+        return input_data, b"audio"
+
+    class LazyTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["file"]
+            assert isinstance(payload, tuple)
+            if payload[0] == "first":
+                started.set()
+                await release.wait()
+            return await super().atranscription(**kwargs)
+
+    monkeypatch.setattr(
+        "infermesh._transcription.normalize_transcription_input",
+        fake_normalize,
+    )
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: LazyTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=1,
+    )
+
+    batch_task = asyncio.create_task(
+        client.atranscribe_batch(
+            ["first", "second"],
+            max_transcription_bytes=None,
+            return_exceptions=False,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.sleep(0.02)
+    assert normalized == ["first"]
+    release.set()
+    await batch_task
+    assert normalized == ["first", "second"]
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_atranscribe_batch_on_progress_callback_error_cancels_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled: list[bytes] = []
+
+    class ProgressAbortTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["file"]
+            assert isinstance(payload, bytes)
+            if payload == b"fast":
+                return await super().atranscription(**kwargs)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(payload)
+                raise
+            raise AssertionError("request should have been cancelled")
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: ProgressAbortTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    with pytest.raises(RuntimeError, match="progress callback failed"):
+        await client.atranscribe_batch(
+            [b"fast", b"slow-a", b"slow-b"],
+            on_progress=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("progress callback failed")
+            ),
+        )
+    assert sorted(cancelled) == [b"slow-a", b"slow-b"]
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_atranscribe_batch_cancellation_cancels_active_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cancelled: list[bytes] = []
+    seen: list[bytes] = []
+
+    class GatedTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["file"]
+            assert isinstance(payload, bytes)
+            seen.append(payload)
+            if len(seen) == 2:
+                started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(payload)
+                raise
+            raise AssertionError("request should have been cancelled")
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: GatedTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+    batch_task = asyncio.create_task(client.atranscribe_batch([b"a", b"b"]))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    batch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch_task
+    assert sorted(cancelled) == [b"a", b"b"]
+    client.close()
 
 
 def test_generate_batch_on_progress_calls_callback(

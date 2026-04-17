@@ -33,22 +33,16 @@ import logging
 import math
 import random
 from collections.abc import Callable, Coroutine, Sequence
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from infermesh._client_runtime import _ClientRuntimeMixin
+from infermesh._embedding import _aembed_batch, _aembed_one
 from infermesh._generation import _agenerate_batch, _agenerate_one
-from infermesh._utils import (
-    build_embedding_results,
-    build_transcription_result,
-    estimate_token_count,
-    normalize_embedding_input,
-    normalize_transcription_input,
-)
+from infermesh._transcription import _atranscribe_batch, _atranscribe_one
 from infermesh.rate_limiter import RateLimiter as _RateLimiter
 from infermesh.types import (
-    BatchResult,
     DeploymentConfig,
     EmbeddingBatchResult,
     EmbeddingResult,
@@ -56,8 +50,11 @@ from infermesh.types import (
     GenerateInput,
     GenerationBatchResult,
     GenerationResult,
+    OnEmbeddingResult,
     OnGenerationResult,
+    OnTranscriptionResult,
     RequestMetrics,
+    TranscriptionBatchResult,
     TranscriptionInput,
     TranscriptionResult,
 )
@@ -613,7 +610,10 @@ class LMClient(_ClientRuntimeMixin):
         self,
         input_batch: Sequence[str],
         *,
+        micro_batch_size: int = 32,
         return_exceptions: bool = True,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_result: OnEmbeddingResult = None,
         **kwargs: Any,
     ) -> EmbeddingBatchResult:
         """Create embeddings for a batch of text strings synchronously.
@@ -622,9 +622,20 @@ class LMClient(_ClientRuntimeMixin):
         ----------
         input_batch : Sequence[str]
             Text values to embed together.
+        micro_batch_size : int, default=32
+            Maximum number of texts to send in a single provider embedding
+            request. Larger logical batches are split into contiguous
+            micro-batches and stitched back together in input order.
         return_exceptions : bool, default=True
-            When ``True``, a provider failure is captured once per item in the
-            ``errors`` list. When ``False``, the provider error is raised.
+            When ``True``, failures are isolated per input item and captured in
+            ``errors``. When ``False``, the first terminal failure cancels the
+            remaining work and is raised.
+        on_progress : callable | None, optional
+            Callback invoked as ``on_progress(completed, total)`` each time an
+            item settles.
+        on_result : callable | None, optional
+            Callback invoked as ``on_result(index, result, error)`` for each
+            settled item.
         **kwargs : Any
             Additional LiteLLM embedding kwargs applied to the batch request.
 
@@ -635,6 +646,8 @@ class LMClient(_ClientRuntimeMixin):
 
         Raises
         ------
+        ValueError
+            If ``micro_batch_size`` is not a positive integer.
         Exception
             The provider error when ``return_exceptions`` is ``False``.
 
@@ -647,7 +660,10 @@ class LMClient(_ClientRuntimeMixin):
         return self._sync_runner.run(
             self.aembed_batch(
                 input_batch,
+                micro_batch_size=micro_batch_size,
                 return_exceptions=return_exceptions,
+                on_progress=on_progress,
+                on_result=on_result,
                 **kwargs,
             )
         )
@@ -678,38 +694,44 @@ class LMClient(_ClientRuntimeMixin):
         >>> len(result.embedding)
         """
 
-        response, metrics = await self._with_retry(
-            lambda: self._dispatch_with_controls(
-                estimated_tokens=estimate_token_count(
-                    self._litellm,
-                    self.model,
-                    input_data,
-                    endpoint="chat_completion",
-                    max_tokens=0,
-                ),
-                request_callable=self._call_embedding,
-                request_args=([input_data],),
-                request_kwargs={"request_kwargs": self._merge_request_kwargs(kwargs)},
-            )
+        return await _aembed_one(
+            self,
+            input_data,
+            request_kwargs=self._merge_request_kwargs(kwargs),
         )
-        results = build_embedding_results(response, metrics=metrics)
-        if not results:
-            raise ValueError("Embedding response did not contain any vectors.")
-        return results[0]
 
     async def aembed_batch(
         self,
         input_batch: Sequence[str],
         *,
+        micro_batch_size: int = 32,
         return_exceptions: bool = True,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_result: OnEmbeddingResult = None,
         **kwargs: Any,
     ) -> EmbeddingBatchResult:
         """Create embeddings for a batch of text strings asynchronously.
 
         Parameters
         ----------
-        input_batch, return_exceptions, **kwargs
-            Follow the same contract as ``embed_batch``.
+        input_batch : Sequence[str]
+            Text values to embed together.
+        micro_batch_size : int, default=32
+            Maximum number of texts to send in a single provider embedding
+            request. Larger logical batches are split into contiguous
+            micro-batches and stitched back together in input order.
+        return_exceptions : bool, default=True
+            When ``True``, failures are isolated per input item and captured in
+            ``errors``. When ``False``, the first terminal failure cancels the
+            remaining work and is raised.
+        on_progress : callable | None, optional
+            Callback invoked as ``on_progress(completed, total)`` each time an
+            item settles.
+        on_result : callable | None, optional
+            Callback invoked as ``on_result(index, result, error)`` for each
+            settled item.
+        **kwargs : Any
+            Additional LiteLLM embedding kwargs applied to the batch request.
 
         Returns
         -------
@@ -718,6 +740,8 @@ class LMClient(_ClientRuntimeMixin):
 
         Raises
         ------
+        ValueError
+            If ``micro_batch_size`` is not a positive integer.
         Exception
             The provider error when ``return_exceptions`` is ``False``.
 
@@ -727,38 +751,15 @@ class LMClient(_ClientRuntimeMixin):
         >>> len(batch.results)
         """
 
-        normalized = normalize_embedding_input(input_batch)
-        if not normalized:
-            return BatchResult(results=[])
-        estimated_tokens = estimate_token_count(
-            self._litellm,
-            self.model,
-            normalized,
-            endpoint="chat_completion",
-            max_tokens=0,
+        return await _aembed_batch(
+            self,
+            input_batch,
+            micro_batch_size=micro_batch_size,
+            return_exceptions=return_exceptions,
+            on_progress=on_progress,
+            on_result=on_result,
+            **kwargs,
         )
-        try:
-            response, metrics = await self._with_retry(
-                lambda: self._dispatch_with_controls(
-                    estimated_tokens=estimated_tokens,
-                    request_callable=self._call_embedding,
-                    request_args=(normalized,),
-                    request_kwargs={
-                        "request_kwargs": self._merge_request_kwargs(kwargs)
-                    },
-                )
-            )
-        except Exception as exc:
-            if not return_exceptions:
-                raise
-            return BatchResult(
-                results=[None] * len(normalized), errors=[exc] * len(normalized)
-            )
-        results = cast(
-            list[EmbeddingResult | None],
-            list(build_embedding_results(response, metrics=metrics)),
-        )
-        return BatchResult(results=results, errors=[None] * len(results))
 
     def transcribe(
         self,
@@ -776,7 +777,10 @@ class LMClient(_ClientRuntimeMixin):
             audio data.
         max_transcription_bytes : int | None, optional
             Defensive size limit applied before the request is sent. Pass
-            ``None`` to disable the check.
+            ``None`` to disable the check. Use that override only in trusted
+            environments where the server is expected to accept larger uploads,
+            because the client may read and send very large audio files in
+            full.
         **kwargs : Any
             Additional LiteLLM transcription kwargs such as language hints.
 
@@ -808,6 +812,71 @@ class LMClient(_ClientRuntimeMixin):
             )
         )
 
+    def transcribe_batch(
+        self,
+        input_batch: Sequence[TranscriptionInput],
+        *,
+        max_transcription_bytes: int | None = DEFAULT_MAX_TRANSCRIPTION_BYTES,
+        return_exceptions: bool = True,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_result: OnTranscriptionResult = None,
+        **kwargs: Any,
+    ) -> TranscriptionBatchResult:
+        """Transcribe a batch of audio inputs synchronously.
+
+        Parameters
+        ----------
+        input_batch : Sequence[TranscriptionInput]
+            Ordered audio inputs to transcribe.
+        max_transcription_bytes : int | None, optional
+            Defensive size limit applied before each request is sent. Pass
+            ``None`` to disable the check. Use that override only in trusted
+            environments where the server is expected to accept larger uploads,
+            because each admitted item may be read and sent in full.
+        return_exceptions : bool, default=True
+            When ``True``, per-item failures are captured in ``errors`` and
+            successful siblings still complete. When ``False``, the first
+            failure cancels the rest and is raised.
+        on_progress : callable | None, optional
+            Callback invoked as ``on_progress(completed, total)`` each time an
+            item settles.
+        on_result : callable | None, optional
+            Callback invoked as ``on_result(index, result, error)`` for each
+            settled item.
+        **kwargs : Any
+            Additional LiteLLM transcription kwargs such as language hints.
+
+        Returns
+        -------
+        TranscriptionBatchResult
+            A result slot for each input item, aligned to the original order.
+
+        Raises
+        ------
+        ValueError
+            If any input cannot be normalized or exceeds
+            ``max_transcription_bytes``.
+        Exception
+            The first terminal provider or normalization error when
+            ``return_exceptions`` is ``False``.
+
+        Examples
+        --------
+        >>> batch = client.transcribe_batch(["a.wav", "b.wav"])
+        >>> [item.text if item else None for item in batch.results]
+        """
+
+        return self._sync_runner.run(
+            self.atranscribe_batch(
+                input_batch,
+                max_transcription_bytes=max_transcription_bytes,
+                return_exceptions=return_exceptions,
+                on_progress=on_progress,
+                on_result=on_result,
+                **kwargs,
+            )
+        )
+
     async def atranscribe(
         self,
         input_data: TranscriptionInput,
@@ -819,8 +888,17 @@ class LMClient(_ClientRuntimeMixin):
 
         Parameters
         ----------
-        input_data, max_transcription_bytes, **kwargs
-            Follow the same contract as ``transcribe``.
+        input_data : TranscriptionInput
+            Local path, raw bytes, or a binary file-like object containing
+            audio data.
+        max_transcription_bytes : int | None, optional
+            Defensive size limit applied before the request is sent. Pass
+            ``None`` to disable the check. Use that override only in trusted
+            environments where the server is expected to accept larger uploads,
+            because the client may read and send very large audio files in
+            full.
+        **kwargs : Any
+            Additional LiteLLM transcription kwargs such as language hints.
 
         Returns
         -------
@@ -841,19 +919,76 @@ class LMClient(_ClientRuntimeMixin):
         >>> result.text
         """
 
-        normalized = normalize_transcription_input(
+        return await _atranscribe_one(
+            self,
             input_data,
-            max_bytes=max_transcription_bytes,
+            max_transcription_bytes=max_transcription_bytes,
+            request_kwargs=self._merge_request_kwargs(kwargs),
         )
-        response, metrics = await self._with_retry(
-            lambda: self._dispatch_with_controls(
-                estimated_tokens=0,
-                request_callable=self._call_transcription,
-                request_args=(normalized,),
-                request_kwargs={"request_kwargs": self._merge_request_kwargs(kwargs)},
-            )
+
+    async def atranscribe_batch(
+        self,
+        input_batch: Sequence[TranscriptionInput],
+        *,
+        max_transcription_bytes: int | None = DEFAULT_MAX_TRANSCRIPTION_BYTES,
+        return_exceptions: bool = True,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_result: OnTranscriptionResult = None,
+        **kwargs: Any,
+    ) -> TranscriptionBatchResult:
+        """Transcribe a batch of audio inputs asynchronously.
+
+        Parameters
+        ----------
+        input_batch : Sequence[TranscriptionInput]
+            Ordered audio inputs to transcribe.
+        max_transcription_bytes : int | None, optional
+            Defensive size limit applied before each request is sent. Pass
+            ``None`` to disable the check. Use that override only in trusted
+            environments where the server is expected to accept larger uploads,
+            because each admitted item may be read and sent in full.
+        return_exceptions : bool, default=True
+            When ``True``, per-item failures are captured in ``errors`` and
+            successful siblings still complete. When ``False``, the first
+            failure cancels the rest and is raised.
+        on_progress : callable | None, optional
+            Callback invoked as ``on_progress(completed, total)`` each time an
+            item settles.
+        on_result : callable | None, optional
+            Callback invoked as ``on_result(index, result, error)`` for each
+            settled item.
+        **kwargs : Any
+            Additional LiteLLM transcription kwargs such as language hints.
+
+        Returns
+        -------
+        TranscriptionBatchResult
+            One result slot per input item, aligned to the original order.
+
+        Raises
+        ------
+        ValueError
+            If any input cannot be normalized or exceeds the configured size
+            limit.
+        Exception
+            The first terminal provider or normalization error when
+            ``return_exceptions`` is ``False``.
+
+        Examples
+        --------
+        >>> batch = await client.atranscribe_batch(["a.wav", "b.wav"])
+        >>> len(batch.results)
+        """
+
+        return await _atranscribe_batch(
+            self,
+            input_batch,
+            max_transcription_bytes=max_transcription_bytes,
+            return_exceptions=return_exceptions,
+            on_progress=on_progress,
+            on_result=on_result,
+            **kwargs,
         )
-        return build_transcription_result(response, metrics=metrics)
 
     async def _with_retry(
         self,

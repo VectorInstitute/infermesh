@@ -188,6 +188,7 @@ class FakeCLIClient:
         self.kwargs = kwargs
         self.closed = False
         self.embed_batch_sizes: list[int] = []
+        self.embed_micro_batch_sizes: list[int | None] = []
 
     def close(self) -> None:
         self.closed = True
@@ -235,6 +236,7 @@ class FakeCLIClient:
         **kwargs: Any,
     ) -> BatchResult[EmbeddingResult]:
         self.embed_batch_sizes.append(len(input_batch))
+        self.embed_micro_batch_sizes.append(kwargs.get("micro_batch_size"))
         results = [
             EmbeddingResult(
                 model_id="embed-model",
