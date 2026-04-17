@@ -678,7 +678,7 @@ EmbeddingBatchResult: TypeAlias = BatchResult[EmbeddingResult]
 TranscriptionBatchResult: TypeAlias = BatchResult[TranscriptionResult]
 """Type alias for a batch of transcription results."""
 
-OnBatchResult: TypeAlias = Callable[[int, T | None, BaseException | None], None] | None
+type OnBatchResult[T] = Callable[[int, T | None, BaseException | None], None] | None
 """Generic callback type for per-result notifications in batch methods.
 
 Called as ``on_result(index, result, error)`` each time a single request

@@ -110,7 +110,7 @@ async def _atranscribe_batch(
                         pending = list(active_tasks)
                         active_tasks.clear()
                         await cancel_tasks(pending)
-                        raise exc
+                        raise
                     assert errors is not None
                     errors[index] = exc
                     if on_result is not None:

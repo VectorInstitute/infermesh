@@ -34,6 +34,12 @@ def _validate_micro_batch_size(micro_batch_size: int) -> None:
         raise ValueError("``micro_batch_size`` must be a positive integer.")
 
 
+def _should_isolate_embedding_failure(self: LMClient, exc: Exception) -> bool:
+    """Return whether a failed micro-batch should be recursively isolated."""
+
+    return not isinstance(exc, self._retryable_exceptions)
+
+
 async def _aembed_one(
     self: LMClient,
     input_data: str,
@@ -105,6 +111,10 @@ async def _resolve_embedding_chunk_capture(
     except Exception as exc:
         if len(input_data) == 1:
             return [(start_index, None, exc)]
+        if not _should_isolate_embedding_failure(self, exc):
+            return [
+                (start_index + offset, None, exc) for offset in range(len(input_data))
+            ]
         midpoint = len(input_data) // 2
         left = await _resolve_embedding_chunk_capture(
             self,
