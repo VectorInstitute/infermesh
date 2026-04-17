@@ -59,6 +59,7 @@ prompts = [
 
 with LMClient(
     model="openai/gpt-4.1-mini",
+    max_parallel_requests=32,
     rpm=500,
     tpm=100_000,
 ) as client:
@@ -83,6 +84,10 @@ if retry_prompts:
 One failing request does not abort the whole batch. Failed items are `None` in
 `batch.results`; the exception is in `batch.errors[i]`. This is deliberate: a single
 provider error should not wipe out a long experiment.
+
+For large Python batches, set `max_parallel_requests` explicitly. That enables
+bounded in-flight scheduling for `generate_batch`; when it is unset, the method
+may start work for the full batch up front.
 
 This code works in Jupyter notebooks without any `asyncio` setup. The sync API runs a
 background event loop so you do not have to.
@@ -197,7 +202,7 @@ import json
 from infermesh import LMClient
 
 with open("results.jsonl", "w") as out, \
-     LMClient(model="openai/gpt-4.1-mini") as client:
+     LMClient(model="openai/gpt-4.1-mini", max_parallel_requests=32) as client:
 
     def save(index: int, result, error) -> None:
         row = {"index": index}
