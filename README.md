@@ -85,9 +85,11 @@ One failing request does not abort the whole batch. Failed items are `None` in
 `batch.results`; the exception is in `batch.errors[i]`. This is deliberate: a single
 provider error should not wipe out a long experiment.
 
-For large Python batches, set `max_parallel_requests` explicitly. That enables
-bounded in-flight scheduling for `generate_batch`; when it is unset, the method
-may start work for the full batch up front.
+For large Python batches, set `max_parallel_requests` explicitly. `generate_batch`
+and `transcribe_batch` both use a bounded in-flight window when it is set; when it
+is unset, they start one coroutine per item up front, which can cause memory pressure
+for very large inputs. `embed_batch` is always micro-batched regardless of
+`max_parallel_requests` — pass `micro_batch_size` to tune chunk size instead.
 
 This code works in Jupyter notebooks without any `asyncio` setup. The sync API runs a
 background event loop so you do not have to.
