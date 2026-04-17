@@ -243,6 +243,45 @@ async def test_aembed_batch_recursively_isolates_bad_items(
 
 
 @pytest.mark.asyncio
+async def test_aembed_batch_does_not_split_retryable_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class RetryableEmbeddingFakeLiteLLM(FakeLiteLLM):
+        async def aembedding(self, **kwargs: Any) -> dict[str, Any]:
+            payload = list(kwargs["input"])
+            calls.append(payload)
+            raise self.RateLimitError("rate limited")
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: RetryableEmbeddingFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_retries=0,
+    )
+
+    batch = await client.aembed_batch(
+        ["a", "b", "c", "d"],
+        micro_batch_size=4,
+        return_exceptions=True,
+    )
+
+    assert calls == [["a", "b", "c", "d"]]
+    assert batch.errors is not None
+    assert all(result is None for result in batch.results)
+    assert all(
+        isinstance(error, RetryableEmbeddingFakeLiteLLM.RateLimitError)
+        for error in batch.errors
+    )
+    client.close()
+
+
+@pytest.mark.asyncio
 async def test_aembed_batch_return_exceptions_false_raises(
     failing_fake_client: LMClient,
 ) -> None:
