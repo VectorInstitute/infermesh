@@ -133,8 +133,11 @@ print(result.request_id)      # provider-assigned ID for debugging
 result = client.embed("The quick brown fox")
 print(result.embedding)          # list[float]
 
-# Multiple strings → sent in one API call
-batch = client.embed_batch(["sentence one", "sentence two", "sentence three"])
+# Multiple strings → processed in resilient micro-batches by default
+batch = client.embed_batch(
+    ["sentence one", "sentence two", "sentence three"],
+    micro_batch_size=32,
+)
 vectors = [r.embedding for r in batch if r is not None]
 ```
 
@@ -145,7 +148,15 @@ result = client.transcribe("recording.wav")   # path, bytes, or file-like object
 print(result.text)
 print(result.language)     # detected language code, e.g. "en"
 print(result.duration_s)   # audio length in seconds
+
+batch = client.transcribe_batch(["recording-a.wav", "recording-b.wav"])
+texts = [r.text if r is not None else None for r in batch]
 ```
+
+Audio inputs larger than 25 MB are rejected by default. Pass
+`max_transcription_bytes=None` only in trusted environments where the server is
+expected to accept larger uploads. Disabling the guard means the client may
+read and send very large audio files in full.
 
 ## CLI
 
@@ -196,6 +207,9 @@ infermesh transcribe --model whisper-1 \
 For long runs, pass `on_result` to write each result to disk as it arrives.
 A crash or interruption only loses the requests that were in-flight at that
 moment — everything already completed is safe on disk.
+
+`generate_batch`, `embed_batch`, and `transcribe_batch` all support the same
+per-item callback contract.
 
 ```python
 import json
@@ -340,6 +354,7 @@ async def main():
         batch  = await client.agenerate_batch(["prompt A", "prompt B", "prompt C"])
         emb    = await client.aembed("The quick brown fox")
         embs   = await client.aembed_batch(["text a", "text b"])
+        txs    = await client.atranscribe_batch(["a.wav", "b.wav"])
 
 asyncio.run(main())
 ```

@@ -60,6 +60,9 @@ completes rather than waiting for the whole batch to finish. This way a
 process crash or interruption only loses the in-flight requests, not
 everything already completed.
 
+`generate_batch`, `embed_batch`, and `transcribe_batch` all support the same
+`on_result(index, result, error)` contract.
+
 Pass an `on_result` callback to `generate_batch` (or `agenerate_batch`):
 
 ```python
@@ -280,8 +283,11 @@ client = LMClient(
 result = client.embed("The quick brown fox")
 print(result.embedding)
 
-# Multiple strings -> sent in one API call
-batch = client.embed_batch(["sentence one", "sentence two", "sentence three"])
+# Multiple strings -> processed in resilient micro-batches by default
+batch = client.embed_batch(
+    ["sentence one", "sentence two", "sentence three"],
+    micro_batch_size=32,
+)
 vectors = [r.embedding for r in batch if r is not None]
 ```
 
@@ -292,11 +298,16 @@ result = client.transcribe("recording.wav")
 print(result.text)
 print(result.language)
 print(result.duration_s)
+
+batch = client.transcribe_batch(["recording-a.wav", "recording-b.wav"])
+texts = [r.text if r is not None else None for r in batch]
 ```
 
 Audio inputs larger than 25 MB are rejected by default. Pass
-`max_transcription_bytes=None` to disable the limit, or a smaller integer to
-tighten it.
+`max_transcription_bytes=None` only in trusted environments where the server is
+expected to accept larger uploads. Disabling the guard means the client may
+read and send very large audio files in full. Pass a smaller integer to
+tighten the limit.
 
 ## Multimodal / VLM
 
@@ -514,7 +525,14 @@ async def main():
         batch = await client.agenerate_batch(["prompt A", "prompt B", "prompt C"])
         embedding = await client.aembed("The quick brown fox")
         embedding_batch = await client.aembed_batch(["text a", "text b"])
-        print(result.output_text, len(batch), len(embedding.embedding), len(embedding_batch))
+        transcription_batch = await client.atranscribe_batch(["a.wav", "b.wav"])
+        print(
+            result.output_text,
+            len(batch),
+            len(embedding.embedding),
+            len(embedding_batch),
+            len(transcription_batch),
+        )
 
 asyncio.run(main())
 ```
