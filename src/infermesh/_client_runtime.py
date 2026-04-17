@@ -93,12 +93,17 @@ class _ClientRuntimeMixin:
         api_key: str | None,
         deployments: dict[str, DeploymentConfig | dict[str, Any]] | None,
         endpoint: EndpointType,
+        max_parallel_requests: int | None,
     ) -> None:
         """Validate top-level constructor arguments."""
 
         validate_endpoint(endpoint)
         if model is None:
             raise ValueError("``model`` is required.")
+        if max_parallel_requests is not None and max_parallel_requests < 1:
+            raise ValueError(
+                "``max_parallel_requests`` must be ``None`` or a positive integer."
+            )
         if deployments is not None and (api_base is not None or api_key is not None):
             raise ValueError(
                 "``api_base`` and ``api_key`` cannot be set when ``deployments`` "

@@ -58,6 +58,20 @@ def test_router_mode_requires_model(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
+@pytest.mark.parametrize("max_parallel_requests", [0, -1])
+def test_max_parallel_requests_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch,
+    max_parallel_requests: int,
+) -> None:
+    monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
+    with pytest.raises(ValueError, match="max_parallel_requests"):
+        LMClient(
+            model="openai/test",
+            api_base="http://localhost:8000/v1",
+            max_parallel_requests=max_parallel_requests,
+        )
+
+
 @pytest.mark.asyncio
 async def test_router_mode_generation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())

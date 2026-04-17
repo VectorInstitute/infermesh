@@ -189,7 +189,7 @@ class LMClient(_ClientRuntimeMixin):
             Per-event-loop cap on concurrent in-flight requests. When set,
             ``generate_batch`` and ``agenerate_batch`` also admit generation
             work through a bounded in-flight window instead of creating one
-            task per item up front.
+            task per item up front. Must be ``None`` or a positive integer.
         rpm, tpm, rpd, tpd : int | None, optional
             Client-side rate-limit settings. When any limit is set, the client
             creates a shared limiter used by sync and async methods.
@@ -225,7 +225,7 @@ class LMClient(_ClientRuntimeMixin):
         ValueError
             If ``model`` is missing, if ``endpoint`` is invalid, or if
             deployment mode is mixed with direct ``api_base``/``api_key``
-            settings.
+            settings, or if ``max_parallel_requests`` is not positive.
 
         Examples
         --------
@@ -243,6 +243,7 @@ class LMClient(_ClientRuntimeMixin):
             api_key=api_key,
             deployments=deployments,
             endpoint=endpoint,
+            max_parallel_requests=max_parallel_requests,
         )
         assert model is not None
         self._warn_on_insecure_api_base(api_base)
