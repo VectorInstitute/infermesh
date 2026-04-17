@@ -698,3 +698,118 @@ def test_on_result_captures_error_on_failure(
     assert result is None
     assert isinstance(error, RuntimeError)
     failing_fake_client.close()
+
+
+@pytest.mark.asyncio
+async def test_on_result_fires_for_failing_item_bounded_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_result must fire for the failing item even when return_exceptions=False (bounded path)."""
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: FailingFakeLiteLLM(fail_on={"bad"}),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+    calls: list[tuple[int, Any, Any]] = []
+    with pytest.raises(RuntimeError, match="Simulated failure"):
+        await client.agenerate_batch(
+            ["good", "bad"],
+            return_exceptions=False,
+            on_result=lambda idx, result, error: calls.append((idx, result, error)),
+        )
+    error_calls = [
+        (idx, result, error) for idx, result, error in calls if error is not None
+    ]
+    assert len(error_calls) == 1
+    fail_idx, fail_result, fail_error = error_calls[0]
+    assert fail_result is None
+    assert isinstance(fail_error, RuntimeError)
+    # The failing item must be the one whose input was "bad"
+    assert fail_idx == 1
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_on_result_fires_for_failing_item_unbounded_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_result must fire for the failing item even when return_exceptions=False (unbounded/TaskGroup path)."""
+    gate = asyncio.Event()
+    cancelled: list[str] = []
+
+    class GatedFailing(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> Any:
+            content = kwargs["messages"][0]["content"]
+            if content == "bad":
+                await asyncio.sleep(0)
+                raise RuntimeError("boom")
+            try:
+                await gate.wait()
+                return await super().acompletion(**kwargs)
+            except asyncio.CancelledError:
+                cancelled.append(content)
+                raise
+
+    monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: GatedFailing())
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    calls: list[tuple[int, Any, Any]] = []
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.agenerate_batch(
+            ["slow", "bad"],
+            return_exceptions=False,
+            on_result=lambda idx, result, error: calls.append((idx, result, error)),
+        )
+    # "bad" (index 1) must have fired on_result with an error
+    error_calls = [
+        (idx, result, error) for idx, result, error in calls if error is not None
+    ]
+    assert len(error_calls) == 1
+    fail_idx, fail_result, fail_error = error_calls[0]
+    assert fail_idx == 1
+    assert fail_result is None
+    assert isinstance(fail_error, RuntimeError)
+    # "slow" was cancelled — on_result must NOT have been called for it
+    assert not any(idx == 0 for idx, _, _ in calls)
+    assert cancelled == ["slow"]
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_on_result_fires_for_failing_item_transcribe_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_result must fire for the failing item even when return_exceptions=False (transcription path)."""
+
+    class FailingTranscriptionFakeLiteLLM(FakeLiteLLM):
+        async def atranscription(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs["file"] == b"bad":
+                raise RuntimeError("transcription boom")
+            return await super().atranscription(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: FailingTranscriptionFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    calls: list[tuple[int, Any, Any]] = []
+    with pytest.raises(RuntimeError, match="transcription boom"):
+        await client.atranscribe_batch(
+            [b"good", b"bad"],
+            return_exceptions=False,
+            on_result=lambda idx, result, error: calls.append((idx, result, error)),
+        )
+    error_calls = [
+        (idx, result, error) for idx, result, error in calls if error is not None
+    ]
+    assert len(error_calls) == 1
+    fail_idx, fail_result, fail_error = error_calls[0]
+    assert fail_idx == 1
+    assert fail_result is None
+    assert isinstance(fail_error, RuntimeError)
+    client.close()
