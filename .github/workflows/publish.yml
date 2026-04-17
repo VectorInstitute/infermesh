@@ -28,6 +28,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4
@@ -37,5 +40,10 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          artifacts: "dist/*"
+          generateReleaseNotes: true
+          allowUpdates: true
