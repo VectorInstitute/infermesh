@@ -199,11 +199,14 @@ class _ClientRuntimeMixin:
         request_callable: Any,
         request_args: tuple[Any, ...],
         request_kwargs: dict[str, Any],
+        queue_started_at: float | None = None,
     ) -> tuple[Any, RequestMetrics]:
         """Run a request with concurrency and rate-limiting controls."""
 
         state = self._get_loop_state()
-        queue_started = time.perf_counter()
+        queue_started = (
+            queue_started_at if queue_started_at is not None else time.perf_counter()
+        )
         handle: RateLimiterAcquisitionHandle | None = None
         semaphore_context = (
             state.semaphore if state.semaphore is not None else _null_async_context()
