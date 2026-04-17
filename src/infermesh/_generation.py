@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel
 
+from infermesh._batch_utils import cancel_tasks
 from infermesh._utils import (
     build_generation_result,
     estimate_token_count,
@@ -116,16 +117,6 @@ async def _gather_with_progress(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     return BatchResult(results=results, errors=errors)
-
-
-async def _cancel_tasks(tasks: Sequence[asyncio.Task[Any]]) -> None:
-    """Cancel unfinished tasks and await their cleanup."""
-
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _fill_bounded_generation_window(
@@ -257,7 +248,7 @@ async def _run_bounded_generation_batch(
             if first_error is not None:
                 pending = list(active_tasks)
                 active_tasks.clear()
-                await _cancel_tasks(pending)
+                await cancel_tasks(pending)
                 raise first_error
 
             next_index = _fill_bounded_generation_window(
@@ -274,7 +265,7 @@ async def _run_bounded_generation_batch(
     except BaseException:
         pending = list(active_tasks)
         active_tasks.clear()
-        await _cancel_tasks(pending)
+        await cancel_tasks(pending)
         raise
     return BatchResult(results=results, errors=errors)
 
