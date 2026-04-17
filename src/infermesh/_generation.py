@@ -170,6 +170,11 @@ def _settle_bounded_generation_task(
         result = task.result()
     except BaseException as exc:  # noqa: BLE001
         if not return_exceptions:
+            if on_result is not None:
+                on_result(index, None, exc)
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
             return completed, exc
         assert errors is not None
         errors[index] = exc
@@ -335,7 +340,17 @@ async def _agenerate_batch(
     ) -> GenerationResult:
         """Wrap a coroutine with progress and result callbacks."""
 
-        result = await coro
+        try:
+            result = await coro
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            completed[0] += 1
+            if on_result is not None:
+                on_result(index, None, exc)
+            if on_progress is not None:
+                on_progress(completed[0], len(coros))
+            raise
         completed[0] += 1
         if on_result is not None:
             on_result(index, result, None)

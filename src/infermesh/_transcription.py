@@ -47,6 +47,51 @@ async def _atranscribe_one(
     return build_transcription_result(response, metrics=metrics)
 
 
+async def _consume_transcribe_task(
+    task: asyncio.Task[TranscriptionResult],
+    index: int,
+    *,
+    return_exceptions: bool,
+    results: list[TranscriptionResult | None],
+    errors: list[BaseException | None] | None,
+    on_result: OnTranscriptionResult,
+    on_progress: Callable[[int, int], None] | None,
+    completed: int,
+    total: int,
+    active_tasks: dict[asyncio.Task[TranscriptionResult], int],
+) -> int:
+    """Apply one finished transcription task to batch state; return new completed count."""
+
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if not return_exceptions:
+            if on_result is not None:
+                on_result(index, None, exc)
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
+            pending = list(active_tasks)
+            active_tasks.clear()
+            await cancel_tasks(pending)
+            raise
+        assert errors is not None
+        errors[index] = exc
+        if on_result is not None:
+            on_result(index, None, exc)
+    else:
+        results[index] = result
+        if on_result is not None:
+            on_result(index, result, None)
+
+    completed += 1
+    if on_progress is not None:
+        on_progress(completed, total)
+    return completed
+
+
 async def _atranscribe_batch(
     self: LMClient,
     input_batch: Sequence[TranscriptionInput],
@@ -101,27 +146,18 @@ async def _atranscribe_batch(
             )
             for task in done:
                 index = active_tasks.pop(task)
-                try:
-                    result = task.result()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    if not return_exceptions:
-                        pending = list(active_tasks)
-                        active_tasks.clear()
-                        await cancel_tasks(pending)
-                        raise
-                    assert errors is not None
-                    errors[index] = exc
-                    if on_result is not None:
-                        on_result(index, None, exc)
-                else:
-                    results[index] = result
-                    if on_result is not None:
-                        on_result(index, result, None)
-                completed += 1
-                if on_progress is not None:
-                    on_progress(completed, total)
+                completed = await _consume_transcribe_task(
+                    task,
+                    index,
+                    return_exceptions=return_exceptions,
+                    results=results,
+                    errors=errors,
+                    on_result=on_result,
+                    on_progress=on_progress,
+                    completed=completed,
+                    total=total,
+                    active_tasks=active_tasks,
+                )
             admit_inputs()
     except BaseException:
         pending = list(active_tasks)
