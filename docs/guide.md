@@ -49,9 +49,11 @@ By default, one failing request does not abort the whole batch. Failed items are
 stored as `None` in `batch.results`, and the corresponding exception is stored
 in `batch.errors[i]`.
 
-For large Python batches, set `max_parallel_requests` explicitly. That enables
-bounded in-flight scheduling for `generate_batch`; when it is unset, the method
-may start work for the full batch up front.
+For large Python batches, set `max_parallel_requests` explicitly. `generate_batch`
+and `transcribe_batch` both use a bounded in-flight window when it is set; when it
+is unset, they start one coroutine per item up front, which can cause memory pressure
+for very large inputs. `embed_batch` is always micro-batched regardless of
+`max_parallel_requests` — pass `micro_batch_size` to tune chunk size instead.
 
 ### Crash-Resilient Batches with `on_result`
 
@@ -91,9 +93,13 @@ The callback receives:
 
 | Argument | Type | Notes |
 |---|---|---|
-| `index` | `int` | Position in `input_batch` |
-| `result` | `GenerationResult \| None` | `None` on failure |
+| `index` | `int` | Position in `input_batch` (global item index, not micro-batch index) |
+| `result` | `GenerationResult \| EmbeddingResult \| TranscriptionResult \| None` | `None` on failure |
 | `error` | `BaseException \| None` | `None` on success |
+
+The same contract applies to `embed_batch` and `transcribe_batch`. For
+`embed_batch`, the index is the position in the original input list even when the
+provider call was part of a micro-batch.
 
 To resume from a partial output file, read the completed indices before the
 batch starts and filter the input:
@@ -302,6 +308,31 @@ print(result.duration_s)
 batch = client.transcribe_batch(["recording-a.wav", "recording-b.wav"])
 texts = [r.text if r is not None else None for r in batch]
 ```
+
+`transcribe_batch` supports the same `on_result` and `on_progress` callbacks as
+`generate_batch`. Use `on_result` to stream results to disk as each file completes
+rather than waiting for the whole batch:
+
+```python
+import json
+
+with open("transcripts.jsonl", "w") as out, \
+     LMClient(model="whisper-1", max_parallel_requests=4) as client:
+
+    def save(index: int, result, error) -> None:
+        row = {"index": index}
+        if error is not None:
+            row["error"] = str(error)
+        else:
+            row["text"] = result.text
+        out.write(json.dumps(row) + "\n")
+        out.flush()
+
+    client.transcribe_batch(audio_paths, on_result=save)
+```
+
+Set `max_parallel_requests` to bound how many audio files are in-flight at once.
+When it is unset, `transcribe_batch` starts all requests up front.
 
 Audio inputs larger than 25 MB are rejected by default. Pass
 `max_transcription_bytes=None` only in trusted environments where the server is
