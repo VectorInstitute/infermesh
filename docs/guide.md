@@ -97,12 +97,13 @@ The callback receives:
 | `result` | `GenerationResult \| EmbeddingResult \| TranscriptionResult \| None` | `None` on failure |
 | `error` | `BaseException \| None` | `None` on success |
 
-The same contract applies to `embed_batch` and `transcribe_batch`. For
-`embed_batch`, the index is the position in the original input list even when the
-provider call was part of a micro-batch.
-
-To resume from a partial output file, read the completed indices before the
-batch starts and filter the input:
+The same contract applies to `embed_batch` and `transcribe_batch`.
+For `embed_batch`, the callback uses the same `index`, `result`, and `error`
+arguments when `on_result` is invoked, and `index` is always the position in the
+original input list even when the provider call was part of a micro-batch.
+Per-item error callbacks are guaranteed when `return_exceptions=True`. With
+`return_exceptions=False`, a failed embedding micro-batch may raise before
+`on_result` is called for the affected indices.
 
 ```python
 done = set()
