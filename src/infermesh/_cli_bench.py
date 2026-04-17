@@ -21,6 +21,54 @@ DEFAULT_SWEEP = [1, 2, 4, 8, 16, 32]
 DEFAULT_EMBED_BATCH_SIZES = [1, 8, 32, 128, 512]
 
 
+def _embedding_request_key(
+    result: EmbeddingResult, index: int
+) -> tuple[Any, Any, Any, Any]:
+    """Return a best-effort key for one underlying embedding request."""
+
+    key = (
+        result.request_id,
+        id(result.metrics) if result.metrics is not None else None,
+        id(result.raw_response) if result.raw_response is not None else None,
+    )
+    if key == (None, None, None):
+        return (*key, index)
+    return (*key, None)
+
+
+def _accumulate_embed_batch_call(
+    result: BatchResult[EmbeddingResult],
+    *,
+    latencies: list[float],
+    service_times: list[float],
+) -> tuple[int, int, int, int]:
+    """Return per-call embedding benchmark totals and update latency stats."""
+
+    total_submitted = 0
+    succeeded = 0
+    failures = 0
+    total_tokens = 0
+    seen_requests: set[tuple[Any, Any, Any, Any]] = set()
+
+    for index, item in enumerate(result.results):
+        total_submitted += 1
+        if item is None:
+            failures += 1
+            continue
+        succeeded += 1
+        key = _embedding_request_key(item, index)
+        if key in seen_requests:
+            continue
+        seen_requests.add(key)
+        if item.metrics is not None:
+            latencies.append(item.metrics.end_to_end_s)
+            service_times.append(item.metrics.service_time_s)
+        if item.token_usage is not None:
+            total_tokens += item.token_usage.total_tokens
+
+    return total_submitted, succeeded, failures, total_tokens
+
+
 def _run_benchmark(
     *,
     task_name: str,
@@ -321,7 +369,10 @@ def _run_embed_batch_benchmark(
         try:
             warmup_batch = batched_cycle(texts, batch_size_sweep[0])
             for _ in range(warmup):
-                warmup_client.embed_batch(warmup_batch)
+                warmup_client.embed_batch(
+                    warmup_batch,
+                    micro_batch_size=batch_size_sweep[0],
+                )
         finally:
             warmup_client.close()
 
@@ -333,6 +384,8 @@ def _run_embed_batch_benchmark(
             latencies: list[float] = []
             service_times: list[float] = []
             total_tokens = 0
+            total_submitted = 0
+            succeeded = 0
             failures = 0
 
             started_at = time.perf_counter()
@@ -343,31 +396,33 @@ def _run_embed_batch_benchmark(
                 file=sys.stderr,
             ) as pbar:
                 for _ in range(requests):
-                    result = client.embed_batch(sample)
-                    first = result.results[0] if result.results else None
-                    if first is None:
-                        failures += 1
-                    else:
-                        if first.metrics is not None:
-                            latencies.append(first.metrics.end_to_end_s)
-                            service_times.append(first.metrics.service_time_s)
-                        if first.token_usage is not None:
-                            total_tokens += first.token_usage.total_tokens
+                    result = client.embed_batch(
+                        sample,
+                        micro_batch_size=batch_size,
+                    )
+                    submitted_delta, succeeded_delta, failures_delta, tokens_delta = (
+                        _accumulate_embed_batch_call(
+                            result,
+                            latencies=latencies,
+                            service_times=service_times,
+                        )
+                    )
+                    total_submitted += submitted_delta
+                    succeeded += succeeded_delta
+                    failures += failures_delta
+                    total_tokens += tokens_delta
                     pbar.update(1)
             elapsed_s = time.perf_counter() - started_at
         finally:
             client.close()
 
-        succeeded = requests - failures
         level: dict[str, Any] = {
             "batch_size": batch_size,
-            "total_submitted": requests,
+            "total_submitted": total_submitted,
             "succeeded": succeeded,
             "failures": failures,
             "elapsed_s": elapsed_s,
-            "vectors_per_second": succeeded * len(sample) / elapsed_s
-            if elapsed_s > 0
-            else 0.0,
+            "vectors_per_second": succeeded / elapsed_s if elapsed_s > 0 else 0.0,
             **_percentile_stats(latencies, service_times),
         }
         if total_tokens:
