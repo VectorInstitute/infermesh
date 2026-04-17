@@ -22,6 +22,7 @@ prompts = [
 
 with LMClient(
     model="openai/gpt-4.1-mini",
+    max_parallel_requests=32,
     rpm=500,
     tpm=100_000,
 ) as client:
@@ -48,6 +49,10 @@ By default, one failing request does not abort the whole batch. Failed items are
 stored as `None` in `batch.results`, and the corresponding exception is stored
 in `batch.errors[i]`.
 
+For large Python batches, set `max_parallel_requests` explicitly. That enables
+bounded in-flight scheduling for `generate_batch`; when it is unset, the method
+may start work for the full batch up front.
+
 ### Crash-Resilient Batches with `on_result`
 
 For large batches, you may want to write results to disk as each request
@@ -65,7 +70,7 @@ from infermesh import LMClient
 prompts = [...]  # large list
 
 with open("results.jsonl", "w") as out, \
-     LMClient(model="openai/gpt-4.1-mini") as client:
+     LMClient(model="openai/gpt-4.1-mini", max_parallel_requests=32) as client:
 
     def save(index: int, result, error) -> None:
         row = {"index": index}
@@ -102,7 +107,7 @@ if output_path.exists():
 pending = [(i, p) for i, p in enumerate(prompts) if i not in done]
 
 with open(output_path, "a") as out, \
-     LMClient(model="openai/gpt-4.1-mini") as client:
+     LMClient(model="openai/gpt-4.1-mini", max_parallel_requests=32) as client:
 
     def save(batch_idx: int, result, error) -> None:
         orig_idx = pending[batch_idx][0]

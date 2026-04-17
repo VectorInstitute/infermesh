@@ -38,14 +38,12 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel
 
 from infermesh._client_runtime import _ClientRuntimeMixin
+from infermesh._generation import _agenerate_batch, _agenerate_one
 from infermesh._utils import (
     build_embedding_results,
-    build_generation_result,
     build_transcription_result,
     estimate_token_count,
-    normalize_batch_input,
     normalize_embedding_input,
-    normalize_generate_input,
     normalize_transcription_input,
 )
 from infermesh.rate_limiter import RateLimiter as _RateLimiter
@@ -188,7 +186,10 @@ class LMClient(_ClientRuntimeMixin):
             Default generation endpoint used by ``generate`` and
             ``generate_batch`` unless a per-call override is supplied.
         max_parallel_requests : int | None, optional
-            Per-event-loop cap on concurrent in-flight requests.
+            Per-event-loop cap on concurrent in-flight requests. When set,
+            ``generate_batch`` and ``agenerate_batch`` also admit generation
+            work through a bounded in-flight window instead of creating one
+            task per item up front. Must be ``None`` or a positive integer.
         rpm, tpm, rpd, tpd : int | None, optional
             Client-side rate-limit settings. When any limit is set, the client
             creates a shared limiter used by sync and async methods.
@@ -224,7 +225,7 @@ class LMClient(_ClientRuntimeMixin):
         ValueError
             If ``model`` is missing, if ``endpoint`` is invalid, or if
             deployment mode is mixed with direct ``api_base``/``api_key``
-            settings.
+            settings, or if ``max_parallel_requests`` is not positive.
 
         Examples
         --------
@@ -242,6 +243,7 @@ class LMClient(_ClientRuntimeMixin):
             api_key=api_key,
             deployments=deployments,
             endpoint=endpoint,
+            max_parallel_requests=max_parallel_requests,
         )
         assert model is not None
         self._warn_on_insecure_api_base(api_base)
@@ -434,6 +436,12 @@ class LMClient(_ClientRuntimeMixin):
             A batch result with one slot per input item. Successful items appear
             in ``results`` and failures, when captured, appear in ``errors``.
 
+        Notes
+        -----
+        For large or memory-sensitive Python batch runs, set
+        ``max_parallel_requests`` on the client. When it is unset,
+        ``generate_batch`` may start work for the full batch up front.
+
         Raises
         ------
         ValueError
@@ -498,82 +506,14 @@ class LMClient(_ClientRuntimeMixin):
         """
 
         request_endpoint = endpoint or self.endpoint
-        normalized_input = normalize_generate_input(input_data, request_endpoint)
-        request_kwargs = self._merge_request_kwargs(kwargs)
-        per_request_max = self._get_generation_output_token_limit(
-            request_kwargs,
-            request_endpoint,
-        )
-        estimated_tokens = estimate_token_count(
-            self._litellm,
-            self.model,
-            normalized_input,
-            endpoint=request_endpoint,
-            max_tokens=per_request_max or self.default_output_tokens,
-        )
-        response, metrics = await self._with_retry(
-            lambda: self._dispatch_with_controls(
-                estimated_tokens=estimated_tokens,
-                request_callable=self._call_generation,
-                request_args=(normalized_input,),
-                request_kwargs={
-                    "endpoint": request_endpoint,
-                    "request_kwargs": request_kwargs,
-                },
-            )
-        )
-        return build_generation_result(
-            response,
+        return await _agenerate_one(
+            self,
+            input_data,
             endpoint=request_endpoint,
             response_format=response_format,
-            parse_output=parse_output or response_format is not None,
-            metrics=metrics,
+            parse_output=parse_output,
+            request_kwargs=self._merge_request_kwargs(kwargs),
         )
-
-    @staticmethod
-    async def _gather_with_progress(
-        coros: list[Coroutine[Any, Any, GenerationResult]],
-        on_progress: Callable[[int, int], None] | None,
-        on_result: OnGenerationResult = None,
-    ) -> GenerationBatchResult:
-        """Gather coroutines with per-item callbacks."""
-
-        async def indexed(
-            index: int,
-            coro: Coroutine[Any, Any, GenerationResult],
-        ) -> tuple[int, GenerationResult | BaseException]:
-            try:
-                return index, await coro
-            except BaseException as exc:  # noqa: BLE001
-                return index, exc
-
-        total = len(coros)
-        results: list[GenerationResult | None] = [None] * total
-        errors: list[BaseException | None] = [None] * total
-        tasks = [
-            asyncio.create_task(indexed(index, coro))
-            for index, coro in enumerate(coros)
-        ]
-        try:
-            for completed, future in enumerate(asyncio.as_completed(tasks), start=1):
-                index, outcome = await future
-                if isinstance(outcome, BaseException):
-                    errors[index] = outcome
-                    if on_result is not None:
-                        on_result(index, None, outcome)
-                else:
-                    results[index] = outcome
-                    if on_result is not None:
-                        on_result(index, outcome, None)
-                if on_progress is not None:
-                    on_progress(completed, total)
-        except BaseException:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        return BatchResult(results=results, errors=errors)
 
     async def agenerate_batch(
         self,
@@ -606,6 +546,12 @@ class LMClient(_ClientRuntimeMixin):
             Batch-sized ``results`` and ``errors`` collections aligned to the
             original input order.
 
+        Notes
+        -----
+        For large or memory-sensitive Python batch runs, set
+        ``max_parallel_requests`` on the client. When it is unset,
+        ``agenerate_batch`` may start work for the full batch up front.
+
         Raises
         ------
         ValueError
@@ -621,80 +567,16 @@ class LMClient(_ClientRuntimeMixin):
         >>> len(batch.results)
         """
 
-        inputs = normalize_batch_input(input_batch)
-        coros = [
-            self.agenerate(
-                item,
-                endpoint=endpoint,
-                response_format=response_format,
-                parse_output=parse_output,
-                **kwargs,
-            )
-            for item in inputs
-        ]
-
-        if return_exceptions:
-            if on_progress is None and on_result is None:
-                raw = await asyncio.gather(*coros, return_exceptions=True)
-                results: list[GenerationResult | None] = []
-                errors: list[BaseException | None] = []
-                for item in raw:
-                    if isinstance(item, BaseException):
-                        results.append(None)
-                        errors.append(item)
-                    else:
-                        results.append(item)
-                        errors.append(None)
-                return BatchResult(results=results, errors=errors)
-            return await self._gather_with_progress(coros, on_progress, on_result)
-
-        completed = [0]
-
-        async def progress_wrapper(
-            index: int, coro: Coroutine[Any, Any, GenerationResult]
-        ) -> GenerationResult:
-            """Wrap a coroutine with progress and result callbacks.
-
-            Parameters
-            ----------
-            index : int
-                The index of the coroutine in the batch.
-            coro : Coroutine[Any, Any, GenerationResult]
-                The coroutine to wrap.
-
-            Returns
-            -------
-            GenerationResult
-                The result of the coroutine.
-
-            Raises
-            ------
-            BaseException
-                If the coroutine raises an exception.
-            """
-            result = await coro
-            completed[0] += 1
-            if on_result is not None:
-                on_result(index, result, None)
-            if on_progress is not None:
-                on_progress(completed[0], len(coros))
-            return result
-
-        strict_tasks: list[asyncio.Task[GenerationResult]] = []
-        try:
-            async with asyncio.TaskGroup() as task_group:
-                strict_tasks = [
-                    task_group.create_task(progress_wrapper(index, coro))
-                    for index, coro in enumerate(coros)
-                ]
-        except BaseException as exc:
-            if isinstance(exc, BaseExceptionGroup):
-                raise exc.exceptions[0] from exc.exceptions[0].__cause__
-            raise
-        return BatchResult(
-            results=cast(
-                list[GenerationResult | None], [task.result() for task in strict_tasks]
-            )
+        return await _agenerate_batch(
+            self,
+            input_batch,
+            endpoint=endpoint,
+            response_format=response_format,
+            parse_output=parse_output,
+            return_exceptions=return_exceptions,
+            on_progress=on_progress,
+            on_result=on_result,
+            **kwargs,
         )
 
     def embed(self, input_data: str, **kwargs: Any) -> EmbeddingResult:

@@ -214,6 +214,53 @@ async def test_responses_max_output_tokens_overrides_default_output_tokens(
     client.close()
 
 
+@pytest.mark.asyncio
+async def test_bounded_generation_batch_queue_wait_includes_scheduler_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SequencedFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            content = kwargs["messages"][0]["content"]
+            if content == "first":
+                started.set()
+                await release.wait()
+            return await super().acompletion(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: SequencedFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=1,
+    )
+    batch_task = asyncio.create_task(
+        client.agenerate_batch(
+            ["first", "second"],
+            return_exceptions=False,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.sleep(0.02)
+    release.set()
+    batch = await batch_task
+
+    first = batch.results[0]
+    second = batch.results[1]
+    assert first is not None
+    assert second is not None
+    assert first.metrics is not None
+    assert second.metrics is not None
+    assert second.metrics.queue_wait_s > first.metrics.queue_wait_s
+    assert second.metrics.queue_wait_s >= 0.02
+    client.close()
+
+
 def test_transcribe_rejects_nonregular_file(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="regular file"):
         normalize_transcription_input(tmp_path)

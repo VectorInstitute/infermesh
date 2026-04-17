@@ -130,6 +130,96 @@ async def test_agenerate_batch_return_exceptions_false_cancels_siblings(
 
 
 @pytest.mark.asyncio
+async def test_agenerate_batch_bounded_window_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    peak = 0
+    completion_order: list[str] = []
+    delays = {"a": 0.05, "b": 0.01, "c": 0.01, "d": 0.01}
+
+    class WindowedFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            nonlocal active, peak
+            content = kwargs["messages"][0]["content"]
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(delays[content])
+                completion_order.append(content)
+                return await super().acompletion(**kwargs)
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: WindowedFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+    batch = await client.agenerate_batch(["a", "b", "c", "d"])
+
+    assert peak == 2
+    assert completion_order[0] == "b"
+    assert [result.output_text if result is not None else None for result in batch] == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_agenerate_batch_bounded_strict_failure_does_not_start_queued_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[str] = []
+    cancelled: list[str] = []
+
+    class BoundedStrictFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            content = kwargs["messages"][0]["content"]
+            seen.append(content)
+            if content == "bad":
+                await asyncio.sleep(0)
+                raise RuntimeError("boom")
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                cancelled.append(content)
+                raise
+            return await super().acompletion(**kwargs)
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: BoundedStrictFakeLiteLLM(),
+    )
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.agenerate_batch(
+            ["slow", "bad", "queued"],
+            return_exceptions=False,
+        )
+
+    assert "queued" not in seen
+    assert sorted(seen) == ["bad", "slow"]
+    assert cancelled == ["slow"]
+    client.close()
+
+
+@pytest.mark.asyncio
 async def test_batch_result_length_parity(failing_fake_client: LMClient) -> None:
     inputs = ["good", "bad", "good", "bad", "good"]
     result = await failing_fake_client.agenerate_batch(inputs)
@@ -199,7 +289,11 @@ async def test_agenerate_batch_on_progress_cancellation_cancels_siblings(
         "_create_litellm_module",
         lambda self: GatedFakeLiteLLM(),
     )
-    client = LMClient(model="openai/test", api_base="http://localhost")
+    client = LMClient(
+        model="openai/test",
+        api_base="http://localhost",
+        max_parallel_requests=2,
+    )
     batch_task = asyncio.create_task(
         client.agenerate_batch(["a", "b"], on_progress=lambda *_: None)
     )
