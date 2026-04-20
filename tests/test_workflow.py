@@ -167,6 +167,7 @@ def _run(
     resume: bool = False,
     window_size: int = 128,
     parse_json: bool = False,
+    on_status: Any = None,
 ) -> None:
     try:
         run_generate_workflow(
@@ -180,6 +181,7 @@ def _run(
             endpoint="chat_completion",
             window_size=window_size,
             parse_json=parse_json,
+            on_status=on_status,
         )
     finally:
         client.close()
@@ -208,16 +210,23 @@ def _load_checkpoint_journal_mode(checkpoint_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_file_backed_generate_streams_input(tmp_path: Path) -> None:
+def test_file_backed_generate_streams_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infermesh._workflow as wf_module
+
     rows = [{"prompt": f"p{i}"} for i in range(7)]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
     client = _FakeClient()
+    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
 
     _run(client, input_path=input_path, output_path=output_path, window_size=3)
 
     assert client.inputs == [f"p{i}" for i in range(7)]
     assert client.peak_active <= 3
+    assert not list(tmp_path.glob(".infermesh-resume-plan.*.sqlite"))
 
     out_rows = _read_output(output_path)
     assert len(out_rows) == 7
@@ -333,6 +342,92 @@ def test_resume_skips_settled_rows(tmp_path: Path) -> None:
 
     state = load_resume_state(checkpoint_path)
     assert {row["status"] for row in state.values()} == {"success"}
+
+
+def test_resume_file_backed_path_uses_disk_backed_planner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infermesh._workflow as wf_module
+
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1, status="pending"
+            ),
+            checkpoint_item_for_record(
+                rows[2], occurrence=0, index=2, status="pending"
+            ),
+        ],
+    )
+
+    def fail_if_row_lookup_used(
+        connection: sqlite3.Connection, checkpoint_key: tuple[bytes, int]
+    ) -> Any:
+        raise AssertionError("row-by-row checkpoint lookups should not be used")
+
+    monkeypatch.setattr(wf_module, "_load_checkpoint_item", fail_if_row_lookup_used)
+
+    client = _FakeClient()
+    _run(client, input_path=input_path, output_path=output_path, resume=True)
+
+    assert client.inputs == ["b", "c"]
+
+
+def test_resume_reports_planner_status_and_cleans_temp_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infermesh._workflow as wf_module
+
+    rows = [{"prompt": "a"}, {"prompt": "b"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1, status="pending"
+            ),
+        ],
+    )
+    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+    statuses: list[str] = []
+
+    client = _FakeClient()
+    _run(
+        client,
+        input_path=input_path,
+        output_path=output_path,
+        resume=True,
+        on_status=statuses.append,
+    )
+
+    assert "Resume: validating checkpoint file..." in statuses
+    assert "Resume: validating output artifact..." in statuses
+    assert "Resume: building resume plan..." in statuses
+    assert "Resume: locating pending rows..." in statuses
+    assert "Opening output and checkpoint files..." in statuses
+    assert not list(tmp_path.glob(".infermesh-resume-plan.*.sqlite"))
 
 
 def test_resume_reuses_checkpoint_dir_override(tmp_path: Path) -> None:
@@ -739,6 +834,38 @@ def test_resume_rejects_truncated_output_file(tmp_path: Path) -> None:
         _run(client, input_path=input_path, output_path=output_path, resume=True)
 
 
+def test_resume_output_bitmap_handles_sparse_high_indexes(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    output_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"_index": 0, "output_text": "cached-a"}),
+                json.dumps({"_index": 1000, "output_text": "cached-b"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1000, status="success"
+            ),
+        ],
+    )
+
+    client = _FakeClient()
+    _run(client, input_path=input_path, output_path=output_path, resume=True)
+
+    assert client.inputs == []
+
+
 def test_completed_run_updates_checkpoint_rows_in_place(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
@@ -1053,15 +1180,20 @@ def test_resume_tracks_duplicate_parse_errors_by_occurrence(tmp_path: Path) -> N
 
 def test_stdout_path_creates_no_checkpoint_file(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import infermesh._workflow as wf_module
+
     rows = [{"prompt": "hello"}]
     input_path = _write_input(tmp_path, rows)
     client = _FakeClient()
+    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
 
     _run(client, input_path=input_path, output_path=None)
 
     assert list(tmp_path.glob("*.checkpoint.sqlite")) == []
+    assert not list(tmp_path.glob(".infermesh-resume-plan.*.sqlite"))
 
     out = capsys.readouterr().out
     out_rows = [json.loads(line) for line in out.splitlines() if line.strip()]
@@ -1156,3 +1288,41 @@ def test_persistence_sink_failure_propagates(
 
     with pytest.raises(RuntimeError, match="injected sink failure"):
         _run(client, input_path=input_path, output_path=output_path)
+
+
+def test_resume_planner_temp_db_is_removed_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infermesh._workflow as wf_module
+
+    rows = [{"prompt": "a"}, {"prompt": "b"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1, status="pending"
+            ),
+        ],
+    )
+
+    def failing_mark(connection, checkpoint_key, *, status, error):
+        raise RuntimeError("injected sink failure")
+
+    monkeypatch.setattr(wf_module, "_mark_checkpoint_item_settled", failing_mark)
+    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+
+    client = _FakeClient()
+    with pytest.raises(RuntimeError, match="injected sink failure"):
+        _run(client, input_path=input_path, output_path=output_path, resume=True)
+
+    assert not list(tmp_path.glob(".infermesh-resume-plan.*.sqlite"))

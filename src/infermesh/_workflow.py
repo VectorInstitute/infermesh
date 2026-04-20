@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import queue
 import sqlite3
 import sys
@@ -74,6 +75,13 @@ class _CheckpointItem:
     error: str | None
 
 
+@dataclass(frozen=True)
+class _ResumePlan:
+    """Ephemeral planner DB that drives resumed file-backed source reads."""
+
+    planner_path: Path
+
+
 @dataclass
 class _PersistenceRequest:
     """One settled row that must be durably written by the sink thread."""
@@ -103,22 +111,47 @@ class _BlockingWorkItemPreparer:
         input_jsonl: str | None,
         resume: bool,
         checkpoint_path: Path | None,
+        resume_plan: _ResumePlan | None,
         mapper: Callable[[dict[str, Any]], Any] | None,
     ) -> None:
         self._prompt = prompt
         self._input_jsonl = input_jsonl
         self._resume = resume
         self._checkpoint_path = checkpoint_path
+        self._resume_plan = resume_plan
         self._mapper = mapper
         self._source_rows: (
             Generator[tuple[_SourceRow, tuple[bytes, int]], None, None] | None
         ) = None
         self._checkpoint_connection: sqlite3.Connection | None = None
+        self._planner_connection: sqlite3.Connection | None = None
+        self._pending_rows: Iterator[tuple[int, int, int, bytes, int]] | None = None
+        self._resume_source_file: IO[bytes] | None = None
 
     def next_prepared(self) -> _PreparedWorkItem | _SourceExhausted:
         """Return the next schedulable work item or source exhaustion sentinel."""
 
         self._ensure_open()
+        if self._pending_rows is not None:
+            for (
+                source_order,
+                output_index,
+                byte_offset,
+                fingerprint,
+                occurrence,
+            ) in self._pending_rows:
+                source_row = _load_source_row_at_offset(
+                    self._resume_source_file,
+                    offset=byte_offset,
+                    source_index=source_order,
+                )
+                return _prepare_mapped_work_item(
+                    source_row=source_row,
+                    output_index=output_index,
+                    checkpoint_key=(fingerprint, occurrence),
+                    mapper=self._mapper,
+                )
+            return _SOURCE_EXHAUSTED
         assert self._source_rows is not None
         for source_row, checkpoint_key in self._source_rows:
             prepared = _prepare_generate_work_item(
@@ -141,10 +174,39 @@ class _BlockingWorkItemPreparer:
         if self._checkpoint_connection is not None:
             self._checkpoint_connection.close()
             self._checkpoint_connection = None
+        if self._planner_connection is not None:
+            self._planner_connection.close()
+            self._planner_connection = None
+        self._pending_rows = None
+        if self._resume_source_file is not None:
+            self._resume_source_file.close()
+            self._resume_source_file = None
 
     def _ensure_open(self) -> None:
         """Lazily initialize iterator and resume connection on the worker thread."""
 
+        if self._resume_plan is not None:
+            if self._pending_rows is not None:
+                return
+            if self._input_jsonl is None:
+                raise RuntimeError("Resume planner requires an input JSONL source.")
+            self._planner_connection = sqlite3.connect(self._resume_plan.planner_path)
+            self._pending_rows = iter(
+                self._planner_connection.execute(
+                    """
+                    SELECT
+                        source_order,
+                        output_index,
+                        byte_offset,
+                        record_fingerprint,
+                        occurrence
+                    FROM pending_work
+                    ORDER BY source_order
+                    """
+                )
+            )
+            self._resume_source_file = open(self._input_jsonl, "rb")  # noqa: SIM115
+            return
         if self._source_rows is None:
             self._source_rows = cast(
                 Generator[tuple[_SourceRow, tuple[bytes, int]], None, None],
@@ -402,6 +464,33 @@ def _connect_checkpoint_db(checkpoint_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _connect_checkpoint_db_read_only(checkpoint_path: Path) -> sqlite3.Connection:
+    """Open a read-only checkpoint connection for resume validation/planning."""
+
+    connection = sqlite3.connect(
+        checkpoint_path.expanduser().resolve(strict=False).as_uri() + "?mode=ro",
+        uri=True,
+    )
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def _resume_planner_temp_dir() -> Path:
+    """Return the directory used for ephemeral resume planner databases."""
+
+    return Path(os.getenv("TMPDIR") or tempfile.gettempdir())
+
+
+def _connect_resume_planner_db(planner_path: Path) -> sqlite3.Connection:
+    """Open the ephemeral planner DB used to prepare resumed runs."""
+
+    connection = sqlite3.connect(planner_path)
+    connection.execute("PRAGMA journal_mode=MEMORY")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    return connection
+
+
 def _initialize_checkpoint_db(
     connection: sqlite3.Connection, mapping_fingerprint: str
 ) -> None:
@@ -520,6 +609,100 @@ def _iter_source_rows(
                     error=None,
                 )
             index += 1
+
+
+def _iter_binary_source_rows_with_offsets(
+    input_jsonl: str,
+) -> Iterator[tuple[_SourceRow, int]]:
+    """Yield file-backed source rows alongside their byte offsets."""
+
+    with open(input_jsonl, "rb") as source:
+        index = 0
+        while True:
+            offset = source.tell()
+            raw_line = source.readline()
+            if not raw_line:
+                return
+            stripped_bytes = raw_line.strip()
+            if not stripped_bytes:
+                continue
+            stripped = stripped_bytes.decode("utf-8")
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                yield (
+                    _SourceRow(
+                        source_index=index,
+                        raw_line=stripped,
+                        raw_record=None,
+                        error=exc,
+                    ),
+                    offset,
+                )
+            else:
+                yield (
+                    _SourceRow(
+                        source_index=index,
+                        raw_line=stripped,
+                        raw_record=record,
+                        error=None,
+                    ),
+                    offset,
+                )
+            index += 1
+
+
+def _load_source_row_at_offset(
+    source_file: IO[bytes] | None, *, offset: int, source_index: int
+) -> _SourceRow:
+    """Seek to ``offset`` and parse one source row from a binary JSONL file."""
+
+    if source_file is None:
+        raise RuntimeError("Resume planner requires an open source file.")
+    source_file.seek(offset)
+    raw_line = source_file.readline()
+    if not raw_line:
+        raise RuntimeError("Resume planner source offset points past EOF.")
+    stripped = raw_line.strip().decode("utf-8")
+    if not stripped:
+        raise RuntimeError("Resume planner source offset points to a blank line.")
+    try:
+        record = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return _SourceRow(
+            source_index=source_index,
+            raw_line=stripped,
+            raw_record=None,
+            error=exc,
+        )
+    return _SourceRow(
+        source_index=source_index,
+        raw_line=stripped,
+        raw_record=record,
+        error=None,
+    )
+
+
+def _set_output_index_bit(bitmap: bytearray, output_index: int) -> None:
+    """Mark one observed output index in a compact bitmap."""
+
+    if output_index < 0:
+        raise ValueError("Output rows must not use negative _index values.")
+    byte_index = output_index // 8
+    if byte_index >= len(bitmap):
+        bitmap.extend(b"\x00" * (byte_index + 1 - len(bitmap)))
+    bitmap[byte_index] |= 1 << (output_index % 8)
+
+
+def _bitmap_contains_output_index(bitmap: bytearray, output_index: int) -> bool:
+    """Return whether ``output_index`` is present in the bitmap."""
+
+    if output_index < 0:
+        return False
+    byte_index = output_index // 8
+    if byte_index >= len(bitmap):
+        return False
+    return bool(bitmap[byte_index] & (1 << (output_index % 8)))
 
 
 def _iter_source_rows_with_keys(
@@ -774,12 +957,12 @@ def _validate_resume_mapping_fingerprint(
         )
 
 
-def _load_output_indices_with_status(
+def _load_output_index_bitmap(
     output_path: Path, on_status: Callable[[str], Any] | None
-) -> set[int]:
-    """Return output indices while emitting coarse resume-scan status lines."""
+) -> bytearray:
+    """Return a bitmap of observed output indices."""
 
-    observed_indices: set[int] = set()
+    observed_indices = bytearray()
     with output_path.open(encoding="utf-8") as file_handle:
         for line_number, line in enumerate(file_handle, start=1):
             stripped = line.strip()
@@ -793,10 +976,210 @@ def _load_output_indices_with_status(
                 continue
             output_index = row.get("_index")
             if isinstance(output_index, int):
-                observed_indices.add(output_index)
+                _set_output_index_bit(observed_indices, output_index)
             if on_status is not None and line_number % _STATUS_LOG_INTERVAL == 0:
                 on_status(f"Resume: scanned {line_number:,} output rows...")
     return observed_indices
+
+
+def _create_resume_planner_path() -> Path:
+    """Create an empty temp path for one ephemeral resume planner DB."""
+
+    planner_dir = _resume_planner_temp_dir()
+    planner_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=planner_dir,
+        prefix=".infermesh-resume-plan.",
+        suffix=".sqlite",
+        delete=False,
+    ) as file_handle:
+        return Path(file_handle.name)
+
+
+def _initialize_resume_planner_db(connection: sqlite3.Connection) -> None:
+    """Create the ephemeral tables used for resume planning."""
+
+    connection.executescript(
+        """
+        CREATE TABLE checkpoint_items (
+            record_fingerprint BLOB NOT NULL,
+            occurrence INTEGER NOT NULL,
+            output_index INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            PRIMARY KEY (record_fingerprint, occurrence)
+        );
+
+        CREATE TABLE source_rows (
+            source_order INTEGER PRIMARY KEY,
+            byte_offset INTEGER NOT NULL,
+            record_fingerprint BLOB NOT NULL
+        );
+        """
+    )
+
+
+def _copy_checkpoint_items_into_resume_planner(
+    planner_connection: sqlite3.Connection,
+    checkpoint_connection: sqlite3.Connection,
+) -> None:
+    """Copy checkpoint items into the local planner DB for set-wise joins."""
+
+    batch: list[tuple[bytes, int, int, int]] = []
+    for row in checkpoint_connection.execute(
+        """
+        SELECT record_fingerprint, occurrence, output_index, status
+        FROM items
+        """
+    ):
+        batch.append((bytes(row[0]), int(row[1]), int(row[2]), int(row[3])))
+        if len(batch) >= _ITEM_INSERT_BATCH_SIZE:
+            planner_connection.executemany(
+                """
+                INSERT INTO checkpoint_items (
+                    record_fingerprint,
+                    occurrence,
+                    output_index,
+                    status
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                batch,
+            )
+            batch.clear()
+    if batch:
+        planner_connection.executemany(
+            """
+            INSERT INTO checkpoint_items (
+                record_fingerprint,
+                occurrence,
+                output_index,
+                status
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            batch,
+        )
+
+
+def _index_resume_source_rows(
+    planner_connection: sqlite3.Connection,
+    *,
+    input_jsonl: str,
+    on_status: Callable[[str], Any] | None = None,
+) -> None:
+    """Index the current source into the ephemeral planner DB."""
+
+    batch: list[tuple[int, int, bytes]] = []
+    for seen_count, (source_row, byte_offset) in enumerate(
+        _iter_binary_source_rows_with_offsets(input_jsonl), start=1
+    ):
+        fingerprint = (
+            _compute_record_fingerprint(source_row.raw_record)
+            if source_row.raw_record is not None
+            else _compute_parse_error_fingerprint(source_row.raw_line)
+        )
+        batch.append((source_row.source_index, byte_offset, fingerprint))
+        if len(batch) >= _ITEM_INSERT_BATCH_SIZE:
+            planner_connection.executemany(
+                """
+                INSERT INTO source_rows (source_order, byte_offset, record_fingerprint)
+                VALUES (?, ?, ?)
+                """,
+                batch,
+            )
+            batch.clear()
+        if on_status is not None and seen_count % _STATUS_LOG_INTERVAL == 0:
+            on_status(f"Resume: indexed {seen_count:,} source rows...")
+    if batch:
+        planner_connection.executemany(
+            """
+            INSERT INTO source_rows (source_order, byte_offset, record_fingerprint)
+            VALUES (?, ?, ?)
+            """,
+            batch,
+        )
+
+
+def _materialize_resume_source_items(planner_connection: sqlite3.Connection) -> None:
+    """Add occurrence-aware source keys to the planner DB."""
+
+    planner_connection.executescript(
+        """
+        CREATE TABLE source_items AS
+        SELECT
+            source_order,
+            byte_offset,
+            record_fingerprint,
+            row_number() OVER (
+                PARTITION BY record_fingerprint
+                ORDER BY source_order
+            ) - 1 AS occurrence
+        FROM source_rows;
+
+        DROP TABLE source_rows;
+
+        CREATE INDEX idx_source_items_key
+        ON source_items(record_fingerprint, occurrence);
+
+        CREATE INDEX idx_checkpoint_items_status_output_index
+        ON checkpoint_items(status, output_index);
+        """
+    )
+
+
+def _validate_resume_source_plan(planner_connection: sqlite3.Connection) -> None:
+    """Validate exact source/checkpoint equivalence using planner joins."""
+
+    source_extra = planner_connection.execute(
+        """
+        SELECT 1
+        FROM source_items AS source
+        LEFT JOIN checkpoint_items AS checkpoint
+        USING (record_fingerprint, occurrence)
+        WHERE checkpoint.output_index IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if source_extra is not None:
+        raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
+
+    checkpoint_extra = planner_connection.execute(
+        """
+        SELECT 1
+        FROM checkpoint_items AS checkpoint
+        LEFT JOIN source_items AS source
+        USING (record_fingerprint, occurrence)
+        WHERE source.source_order IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if checkpoint_extra is not None:
+        raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
+
+
+def _materialize_pending_work(planner_connection: sqlite3.Connection) -> int:
+    """Build the pending-work relation ordered by current source order."""
+
+    planner_connection.executescript(
+        f"""
+        CREATE TABLE pending_work AS
+        SELECT
+            source.source_order,
+            source.byte_offset,
+            checkpoint.output_index,
+            checkpoint.record_fingerprint,
+            checkpoint.occurrence
+        FROM source_items AS source
+        INNER JOIN checkpoint_items AS checkpoint
+        USING (record_fingerprint, occurrence)
+        WHERE checkpoint.status = {_PENDING_STATUS};
+
+        CREATE INDEX idx_pending_work_source_order
+        ON pending_work(source_order);
+        """
+    )
+    row = planner_connection.execute("SELECT COUNT(*) FROM pending_work").fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def _load_checkpoint_fingerprint_counts(
@@ -825,7 +1208,7 @@ def _validate_resume_output_rows(
 
     if on_status is not None:
         on_status("Resume: validating output artifact...")
-    output_indices = _load_output_indices_with_status(output_path, on_status)
+    output_indices = _load_output_index_bitmap(output_path, on_status)
     missing_indices: list[int] = []
 
     for row in connection.execute(
@@ -838,7 +1221,7 @@ def _validate_resume_output_rows(
         (_SUCCESS_STATUS, _ERROR_STATUS),
     ):
         output_index = int(row[0])
-        if output_index not in output_indices:
+        if not _bitmap_contains_output_index(output_indices, output_index):
             missing_indices.append(output_index)
             if len(missing_indices) >= 11:
                 break
@@ -888,6 +1271,45 @@ def _validate_resume_source(
         raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
 
 
+def _build_resume_plan(
+    *,
+    checkpoint_connection: sqlite3.Connection,
+    input_jsonl: str,
+    on_status: Callable[[str], Any] | None = None,
+) -> _ResumePlan:
+    """Build an ephemeral planner DB for a resumed file-backed workflow."""
+
+    planner_path = _create_resume_planner_path()
+    planner_connection: sqlite3.Connection | None = None
+    try:
+        planner_connection = _connect_resume_planner_db(planner_path)
+        _initialize_resume_planner_db(planner_connection)
+        _copy_checkpoint_items_into_resume_planner(
+            planner_connection,
+            checkpoint_connection,
+        )
+        if on_status is not None:
+            on_status("Resume: building resume plan...")
+        _index_resume_source_rows(
+            planner_connection,
+            input_jsonl=input_jsonl,
+            on_status=on_status,
+        )
+        _materialize_resume_source_items(planner_connection)
+        if on_status is not None:
+            on_status("Resume: locating pending rows...")
+        _validate_resume_source_plan(planner_connection)
+        _materialize_pending_work(planner_connection)
+        planner_connection.commit()
+        return _ResumePlan(planner_path=planner_path)
+    except BaseException:
+        planner_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if planner_connection is not None:
+            planner_connection.close()
+
+
 def _validate_resume_checkpoint(
     output_path: Path,
     checkpoint_path: Path,
@@ -896,8 +1318,8 @@ def _validate_resume_checkpoint(
     prompt: str | None,
     input_jsonl: str | None,
     on_status: Callable[[str], Any] | None = None,
-) -> None:
-    """Validate the resume checkpoint for a file-backed workflow."""
+) -> _ResumePlan | None:
+    """Validate the resume checkpoint and optionally build a resume plan."""
 
     if not checkpoint_path.exists():
         raise ValueError(
@@ -910,7 +1332,7 @@ def _validate_resume_checkpoint(
             f"{checkpoint_path} already exists."
         )
 
-    connection = _connect_checkpoint_db(checkpoint_path)
+    connection = _connect_checkpoint_db_read_only(checkpoint_path)
     try:
         if on_status is not None:
             on_status("Resume: validating checkpoint file...")
@@ -919,12 +1341,19 @@ def _validate_resume_checkpoint(
             mapping_fingerprint=mapping_fingerprint,
         )
         _validate_resume_output_rows(connection, output_path, on_status=on_status)
+        if prompt is None and input_jsonl is not None:
+            return _build_resume_plan(
+                checkpoint_connection=connection,
+                input_jsonl=input_jsonl,
+                on_status=on_status,
+            )
         _validate_resume_source(
             connection,
             prompt=prompt,
             input_jsonl=input_jsonl,
             on_status=on_status,
         )
+        return None
     finally:
         connection.close()
 
@@ -1132,6 +1561,23 @@ def _prepare_generate_work_item(
     if output_index is None:
         return None
 
+    return _prepare_mapped_work_item(
+        source_row=source_row,
+        output_index=output_index,
+        checkpoint_key=checkpoint_key,
+        mapper=mapper,
+    )
+
+
+def _prepare_mapped_work_item(
+    *,
+    source_row: _SourceRow,
+    output_index: int,
+    checkpoint_key: tuple[bytes, int],
+    mapper: Callable[[dict[str, Any]], Any] | None,
+) -> _PreparedWorkItem:
+    """Prepare one already-selected row for mapping/generation."""
+
     if source_row.error is not None:
         return _PreparedWorkItem(
             output_index=output_index,
@@ -1293,6 +1739,7 @@ def _run_generate_source_rows(
     effective_input_jsonl: str | None,
     resume: bool,
     checkpoint_path: Path | None,
+    resume_plan: _ResumePlan | None,
     persistence_sink: _FileBackedPersistenceSink | None,
     mapper: Callable[[dict[str, Any]], Any] | None,
     window_size: int,
@@ -1307,6 +1754,7 @@ def _run_generate_source_rows(
         input_jsonl=effective_input_jsonl,
         resume=resume,
         checkpoint_path=checkpoint_path,
+        resume_plan=resume_plan,
         mapper=mapper,
     )
     with ThreadPoolExecutor(
@@ -1331,6 +1779,7 @@ def _run_generate_source_rows(
 def _cleanup_generate_workflow_resources(
     *,
     persistence_sink: _FileBackedPersistenceSink | None,
+    resume_plan: _ResumePlan | None,
     staged_stdin_path: Path | None,
 ) -> None:
     """Release workflow resources and re-raise the first cleanup failure."""
@@ -1339,6 +1788,8 @@ def _cleanup_generate_workflow_resources(
     steps: list[Callable[[], None]] = []
     if persistence_sink is not None:
         steps.append(persistence_sink.close)
+    if resume_plan is not None:
+        steps.append(lambda: resume_plan.planner_path.unlink(missing_ok=True))
     if staged_stdin_path is not None:
         steps.append(lambda: staged_stdin_path.unlink(missing_ok=True))
     for step in steps:
@@ -1389,6 +1840,7 @@ def run_generate_workflow(
     )
 
     persistence_sink: _FileBackedPersistenceSink | None = None
+    resume_plan: _ResumePlan | None = None
 
     try:
         _validate_distinct_input_output_paths(
@@ -1409,7 +1861,7 @@ def run_generate_workflow(
 
         if resume and output_path is not None:
             assert checkpoint_path is not None
-            _validate_resume_checkpoint(
+            resume_plan = _validate_resume_checkpoint(
                 output_path,
                 checkpoint_path,
                 mapping_fingerprint=mapping_fingerprint,
@@ -1431,6 +1883,7 @@ def run_generate_workflow(
             effective_input_jsonl=effective_input_jsonl,
             resume=resume,
             checkpoint_path=checkpoint_path,
+            resume_plan=resume_plan,
             persistence_sink=persistence_sink,
             mapper=mapper,
             window_size=window_size,
@@ -1442,5 +1895,6 @@ def run_generate_workflow(
     finally:
         _cleanup_generate_workflow_resources(
             persistence_sink=persistence_sink,
+            resume_plan=resume_plan,
             staged_stdin_path=staged_stdin_path,
         )
