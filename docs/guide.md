@@ -92,7 +92,7 @@ with open("results.jsonl", "w") as out, \
 The callback receives:
 
 | Argument | Type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `index` | `int` | Position in `input_batch` (global item index, not micro-batch index) |
 | `result` | `GenerationResult \| EmbeddingResult \| TranscriptionResult \| None` | `None` on failure |
 | `error` | `BaseException \| None` | `None` on success |
@@ -199,6 +199,11 @@ results.jsonl             ← your output (human-readable)
 results.checkpoint.sqlite ← checkpoint file (resume state)
 ```
 
+By default the checkpoint stays beside the output for portability and
+discoverability. If you want the checkpoint on local scratch instead, pass
+`--checkpoint-dir DIR` or set `INFERMESH_CHECKPOINT_DIR=DIR` before the run.
+When you resume later, reuse the same checkpoint-dir setting.
+
 If a long batch is interrupted (Ctrl-C, OOM, network loss), re-run with
 `--resume` to skip settled items and append only the remaining rows:
 
@@ -234,8 +239,8 @@ Row-level generation failures become per-item `error` rows and do not abort
 their siblings, but setup and workflow failures still stop the command.
 Use the `_index` field to re-sort after the run if needed.
 
-`--resume` requires `--output-jsonl` and the matching `results.checkpoint.sqlite`
-checkpoint file from a previous file-backed run. If the checkpoint is missing,
+`--resume` requires `--output-jsonl` and the matching checkpoint file from a
+previous file-backed run. If the checkpoint is missing,
 if the input and output paths are the same file, if the output file is missing
 any settled `_index` rows recorded in the checkpoint, or if the current input
 does not match the original row occurrences, infermesh fails fast instead of
