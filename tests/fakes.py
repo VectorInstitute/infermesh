@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
+from infermesh._workflow import _compute_record_fingerprint
 from infermesh.client import LMClient
 from infermesh.types import (
     BatchResult,
@@ -264,6 +265,28 @@ class FakeCLIClient:
             text=f"transcribed:{Path(path).name}",
             request_id="tx-1",
         )
+
+
+def state_row_for_record(
+    record: dict[str, Any],
+    *,
+    occurrence: int,
+    index: int,
+    status: str,
+    error: str | None = None,
+    mapping_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Build a checkpoint state row for a well-formed source record."""
+    row: dict[str, Any] = {
+        "record_fingerprint": _compute_record_fingerprint(record),
+        "occurrence": occurrence,
+        "_index": index,
+        "status": status,
+        "error": error,
+    }
+    if mapping_fingerprint is not None:
+        row["mapping_fingerprint"] = mapping_fingerprint
+    return row
 
 
 @pytest.fixture

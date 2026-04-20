@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -25,24 +25,17 @@ from infermesh._cli_bench import (
 from infermesh._cli_support import (
     ClientConfig,
     _add_connection_args,
+    _client_config_from_args,
     _load_embed_texts,
     _load_generation_rows,
     _load_transcription_paths,
-    _maybe_parse_json,
     _token_usage_to_dict,
     _write_jsonl,
 )
-from infermesh._cli_support import (
-    _build_client as _support_build_client,
-)
-from infermesh._cli_support import (
-    _client_config_from_args as _support_client_config_from_args,
-)
+from infermesh._cli_support import _build_client as _support_build_client
 from infermesh._utils import batched_cycle
+from infermesh._workflow import run_generate_workflow
 from infermesh.client import LMClient
-from infermesh.types import EndpointType
-
-_client_config_from_args = _support_client_config_from_args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,17 +53,25 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _build_client(
-    config: ClientConfig,
-    *,
-    max_parallel_requests: int | None = None,
+    config: ClientConfig, *, max_parallel_requests: int | None = None
 ) -> LMClient:
     """Build an ``LMClient`` instance for CLI commands."""
 
     return _support_build_client(
-        config,
-        max_parallel_requests=max_parallel_requests,
-        client_cls=LMClient,
+        config, max_parallel_requests=max_parallel_requests, client_cls=LMClient
     )
+
+
+@contextmanager
+def _managed_client(
+    config: ClientConfig, *, max_parallel_requests: int | None = None
+) -> Iterator[LMClient]:
+    """Build a client and guarantee ``close()`` on exit regardless of errors."""
+    client = _build_client(config, max_parallel_requests=max_parallel_requests)
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -112,8 +113,7 @@ def _add_generate_parser(subparsers: Any) -> None:
         ),
     )
     generate_parser.add_argument(
-        "--output-jsonl",
-        help="Write one result object per input row.",
+        "--output-jsonl", help="Write one result object per input row."
     )
     generate_parser.add_argument(
         "--endpoint",
@@ -129,8 +129,17 @@ def _add_generate_parser(subparsers: Any) -> None:
         "--resume",
         action="store_true",
         help=(
-            "Resume a previous run by reading completed _index values from "
-            "--output-jsonl and appending the remaining rows."
+            "Resume a previous run by reading the checkpoint manifest "
+            "*.state.jsonl and appending the unsettled rows."
+        ),
+    )
+    generate_parser.add_argument(
+        "--mapper",
+        metavar="MODULE:FUNC",
+        help=(
+            "Import path of a mapper function: 'package.module:function'. "
+            "The function receives a raw source record (dict) and must return "
+            "a dict with at least an 'input' key."
         ),
     )
     generate_parser.set_defaults(handler=_handle_generate)
@@ -324,350 +333,183 @@ def _add_bench_embed_parser(bench_subparsers: Any) -> None:
     bench_embed_parser.set_defaults(handler=_handle_bench_embed)
 
 
-def _load_completed_generation_indices(output_jsonl: str) -> set[int]:
-    """Read completed ``_index`` values from an existing output JSONL file."""
-
-    completed: set[int] = set()
-    if not Path(output_jsonl).exists():
-        return completed
-
-    with open(output_jsonl, encoding="utf-8") as file_handle:
-        for raw_line in file_handle:
-            stripped_line = raw_line.strip()
-            if not stripped_line:
-                continue
-            try:
-                index = json.loads(stripped_line).get("_index")
-            except json.JSONDecodeError:
-                continue
-            if isinstance(index, int):
-                completed.add(index)
-    return completed
-
-
-def _build_pending_generation_inputs(
-    all_rows: list[dict[str, Any]],
-    done: set[int],
-) -> list[tuple[int, Any]]:
-    """Return the generation inputs that still need to run."""
-
-    pending: list[tuple[int, Any]] = []
-    for orig_idx, row in enumerate(all_rows):
-        if orig_idx in done:
-            continue
-        input_data = (
-            row.get("responses_input") or row.get("messages") or row.get("prompt")
-        )
-        if input_data is None:
-            raise ValueError(
-                "Generation rows require 'prompt', 'messages', or 'responses_input'."
-            )
-        pending.append((orig_idx, input_data))
-    return pending
-
-
-def _build_generation_record(
-    orig_idx: int,
-    result: Any,
-    error: BaseException | None,
-    *,
-    parse_json: bool,
-) -> dict[str, Any]:
-    """Convert one generation result into its JSONL output shape."""
-
-    if result is None:
-        return {
-            "_index": orig_idx,
-            "output_text": None,
-            "output_parsed": None,
-            "token_usage": None,
-            "request_id": None,
-            "finish_reason": None,
-            "error": str(error) if error else "unknown error",
-        }
-    return {
-        "_index": orig_idx,
-        "output_text": result.output_text,
-        "output_parsed": _maybe_parse_json(result.output_text) if parse_json else None,
-        "token_usage": _token_usage_to_dict(result),
-        "request_id": result.request_id,
-        "finish_reason": result.finish_reason,
-        "error": None,
-    }
-
-
-def _write_generation_batch_to_file(
-    client: LMClient,
-    *,
-    inputs: list[Any],
-    pending: list[tuple[int, Any]],
-    output_jsonl: str,
-    resume: bool,
-    endpoint: EndpointType,
-    parse_json: bool,
-    on_progress: Any,
-) -> None:
-    """Stream generation results to disk as each request completes."""
-
-    file_mode = "a" if resume else "w"
-    with open(output_jsonl, file_mode, encoding="utf-8") as out_file:
-
-        def on_result(
-            batch_idx: int,
-            result: Any,
-            error: BaseException | None,
-        ) -> None:
-            orig_idx = pending[batch_idx][0]
-            record = _build_generation_record(
-                orig_idx,
-                result,
-                error,
-                parse_json=parse_json,
-            )
-            out_file.write(json.dumps(record) + "\n")
-            out_file.flush()
-
-        client.generate_batch(
-            inputs,
-            endpoint=endpoint,
-            on_progress=on_progress,
-            on_result=on_result,
-        )
-
-
-def _write_generation_batch_to_stdout(
-    client: LMClient,
-    *,
-    inputs: list[Any],
-    pending: list[tuple[int, Any]],
-    endpoint: EndpointType,
-    parse_json: bool,
-    on_progress: Any,
-) -> None:
-    """Collect generation results and write them to stdout together."""
-
-    batch = client.generate_batch(
-        inputs,
-        endpoint=endpoint,
-        on_progress=on_progress,
-    )
-    records = []
-    for batch_idx, result in enumerate(batch):
-        error = batch.errors[batch_idx] if batch.errors else None
-        records.append(
-            _build_generation_record(
-                pending[batch_idx][0],
-                result,
-                error,
-                parse_json=parse_json,
-            )
-        )
-    _write_jsonl(records, None)
-
-
-def _run_generate_command(
-    client: LMClient,
-    args: argparse.Namespace,
-    *,
-    endpoint: EndpointType,
-) -> int:
-    """Execute the core generation workflow after client construction."""
-
-    resume = bool(getattr(args, "resume", False))
-    all_rows = _load_generation_rows(prompt=args.prompt, input_jsonl=args.input_jsonl)
-    done = (
-        _load_completed_generation_indices(args.output_jsonl)
-        if resume and args.output_jsonl
-        else set()
-    )
-    if done:
-        sys.stderr.write(f"Resuming: skipping {len(done)} already-completed row(s).\n")
-
-    pending = _build_pending_generation_inputs(all_rows, done)
-    if not pending:
-        sys.stderr.write("Nothing to do — all rows already completed.\n")
-        return 0
-
-    inputs = [input_data for _, input_data in pending]
-    parse_json = bool(getattr(args, "parse_json", False))
-    with tqdm(
-        total=len(pending),
-        desc="Generating",
-        unit="req",
-        disable=(len(pending) <= 1),
-        file=sys.stderr,
-    ) as progress_bar:
-
-        def on_progress(_done: int, _total: int) -> None:
-            progress_bar.update(1)
-
-        if args.output_jsonl:
-            _write_generation_batch_to_file(
-                client,
-                inputs=inputs,
-                pending=pending,
-                output_jsonl=args.output_jsonl,
-                resume=resume,
-                endpoint=endpoint,
-                parse_json=parse_json,
-                on_progress=on_progress,
-            )
-        else:
-            _write_generation_batch_to_stdout(
-                client,
-                inputs=inputs,
-                pending=pending,
-                endpoint=endpoint,
-                parse_json=parse_json,
-                on_progress=on_progress,
-            )
-    return 0
-
-
 def _handle_generate(args: argparse.Namespace) -> int:
     """Handle the ``generate`` subcommand."""
 
-    resume = getattr(args, "resume", False)
+    resume = bool(getattr(args, "resume", False))
     if resume and not args.output_jsonl:
         sys.stderr.write("error: --resume requires --output-jsonl\n")
         return 1
 
     config = _client_config_from_args(args)
-    client = _build_client(config)
-    try:
-        return _run_generate_command(client, args, endpoint=config.endpoint)
-    finally:
-        client.close()
+    window_size = config.max_parallel_requests or 128
+
+    # Use an open-ended progress bar for file-backed runs (total unknown up
+    # front).  For a single --prompt to stdout, suppress it entirely.
+    disable_bar = args.output_jsonl is None and args.prompt is not None
+    with tqdm(
+        desc="Generating", unit="req", disable=disable_bar, file=sys.stderr
+    ) as bar:
+        try:
+            with _managed_client(config) as client:
+                run_generate_workflow(
+                    client,
+                    prompt=args.prompt,
+                    input_jsonl=args.input_jsonl,
+                    output_jsonl=args.output_jsonl,
+                    mapper_spec=getattr(args, "mapper", None),
+                    resume=resume,
+                    endpoint=config.endpoint,
+                    window_size=window_size,
+                    parse_json=bool(getattr(args, "parse_json", False)),
+                    on_progress=lambda: bar.update(),  # noqa: PLW0108
+                )
+        except (ImportError, ValueError) as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 1
+    return 0
 
 
 def _handle_embed(args: argparse.Namespace) -> int:
     """Handle the ``embed`` subcommand."""
 
-    client = _build_client(_client_config_from_args(args))
     try:
-        texts = _load_embed_texts(text=args.text, input_jsonl=args.input_jsonl)
-        batch = client.embed_batch(texts)
-        rows: list[dict[str, Any]] = []
-        for index, result in enumerate(batch):
-            if result is None:
-                error = batch.errors[index] if batch.errors else None
-                rows.append(
-                    {
-                        "embedding": None,
-                        "dimensions": None,
-                        "request_id": None,
-                        "token_usage": None,
-                        "error": str(error) if error else "unknown error",
-                    }
-                )
-            else:
-                rows.append(
-                    {
-                        "embedding": None if args.no_vectors else result.embedding,
-                        "dimensions": len(result.embedding),
-                        "request_id": result.request_id,
-                        "token_usage": _token_usage_to_dict(result),
-                        "error": None,
-                    }
-                )
-        _write_jsonl(rows, args.output_jsonl)
-    finally:
-        client.close()
+        with _managed_client(_client_config_from_args(args)) as client:
+            texts = _load_embed_texts(text=args.text, input_jsonl=args.input_jsonl)
+            batch = client.embed_batch(texts)
+            rows: list[dict[str, Any]] = []
+            for index, result in enumerate(batch):
+                if result is None:
+                    error = batch.errors[index] if batch.errors else None
+                    rows.append(
+                        {
+                            "embedding": None,
+                            "dimensions": None,
+                            "request_id": None,
+                            "token_usage": None,
+                            "error": str(error) if error else "unknown error",
+                        }
+                    )
+                else:
+                    rows.append(
+                        {
+                            "embedding": None if args.no_vectors else result.embedding,
+                            "dimensions": len(result.embedding),
+                            "request_id": result.request_id,
+                            "token_usage": _token_usage_to_dict(result),
+                            "error": None,
+                        }
+                    )
+            _write_jsonl(rows, args.output_jsonl)
+    except (ImportError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
     return 0
 
 
 def _handle_transcribe(args: argparse.Namespace) -> int:
     """Handle the ``transcribe`` subcommand."""
 
-    client = _build_client(_client_config_from_args(args))
     try:
-        paths = _load_transcription_paths(path=args.path, input_jsonl=args.input_jsonl)
-        rows: list[dict[str, Any]] = []
-        for path in tqdm(
-            paths,
-            desc="Transcribing",
-            unit="file",
-            disable=(len(paths) <= 1),
-            file=sys.stderr,
-        ):
-            result = client.transcribe(path)
-            rows.append(
-                {
-                    "text": result.text,
-                    "duration_s": result.duration_s,
-                    "language": result.language,
-                    "request_id": result.request_id,
-                    "error": None,
-                }
+        with _managed_client(_client_config_from_args(args)) as client:
+            paths = _load_transcription_paths(
+                path=args.path, input_jsonl=args.input_jsonl
             )
-        _write_jsonl(rows, args.output_jsonl)
-    finally:
-        client.close()
+            rows: list[dict[str, Any]] = []
+            for path in tqdm(
+                paths,
+                desc="Transcribing",
+                unit="file",
+                disable=(len(paths) <= 1),
+                file=sys.stderr,
+            ):
+                result = client.transcribe(path)
+                rows.append(
+                    {
+                        "text": result.text,
+                        "duration_s": result.duration_s,
+                        "language": result.language,
+                        "request_id": result.request_id,
+                        "error": None,
+                    }
+                )
+            _write_jsonl(rows, args.output_jsonl)
+    except (ImportError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
     return 0
 
 
 def _handle_bench_generate(args: argparse.Namespace) -> int:
     """Handle ``bench generate``."""
 
-    config = _client_config_from_args(args)
-    rows = _load_generation_rows(prompt=args.prompt, input_jsonl=args.input_jsonl)
-    input_items = [
-        row.get("responses_input") or row.get("messages") or row.get("prompt")
-        for row in rows
-    ]
-    if not input_items:
-        raise ValueError("Generation benchmark requires input rows or --prompt.")
+    try:
+        config = _client_config_from_args(args)
+        rows = _load_generation_rows(prompt=args.prompt, input_jsonl=args.input_jsonl)
+        input_items = [
+            row.get("responses_input") or row.get("messages") or row.get("prompt")
+            for row in rows
+        ]
+        if not input_items:
+            raise ValueError("Generation benchmark requires input rows or --prompt.")
 
-    concurrency_levels, recommend = _resolve_sweep_levels(
-        single=getattr(args, "concurrency", None),
-        maximum=getattr(args, "max_concurrency", None),
-        default=DEFAULT_SWEEP,
-        sweep_fn=_build_concurrency_sweep,
-    )
-    summary = _run_benchmark(
-        task_name="generate",
-        warmup=args.warmup,
-        requests=args.requests,
-        duration_s=getattr(args, "duration", None),
-        concurrency_sweep=concurrency_levels,
-        recommend=recommend,
-        workload_factory=lambda concurrency: _build_client(
-            config,
-            max_parallel_requests=concurrency,
-        ),
-        runner=lambda client, batch, *, on_progress=None: client.generate_batch(
-            batch,
-            endpoint=config.endpoint,
-            on_progress=on_progress,
-        ),
-        workload=batched_cycle(input_items, max(args.requests, args.warmup)),
-    )
-    _write_generate_summary(summary, args.output_json)
+        concurrency_levels, recommend = _resolve_sweep_levels(
+            single=getattr(args, "concurrency", None),
+            maximum=getattr(args, "max_concurrency", None),
+            default=DEFAULT_SWEEP,
+            sweep_fn=_build_concurrency_sweep,
+        )
+        summary = _run_benchmark(
+            task_name="generate",
+            warmup=args.warmup,
+            requests=args.requests,
+            duration_s=getattr(args, "duration", None),
+            concurrency_sweep=concurrency_levels,
+            recommend=recommend,
+            workload_factory=lambda concurrency: _build_client(
+                config,
+                max_parallel_requests=concurrency,
+            ),
+            runner=lambda client, batch, *, on_progress=None: client.generate_batch(
+                batch,
+                endpoint=config.endpoint,
+                on_progress=on_progress,
+            ),
+            workload=batched_cycle(input_items, max(args.requests, args.warmup)),
+        )
+        _write_generate_summary(summary, args.output_json)
+    except (ImportError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
     return 0
 
 
 def _handle_bench_embed(args: argparse.Namespace) -> int:
     """Handle ``bench embed``."""
 
-    config = _client_config_from_args(args)
-    texts = _load_embed_texts(text=args.text, input_jsonl=args.input_jsonl)
-    if not texts:
-        raise ValueError("Embedding benchmark requires input rows or --text.")
+    try:
+        config = _client_config_from_args(args)
+        texts = _load_embed_texts(text=args.text, input_jsonl=args.input_jsonl)
+        if not texts:
+            raise ValueError("Embedding benchmark requires input rows or --text.")
 
-    batch_sizes, recommend = _resolve_sweep_levels(
-        single=getattr(args, "batch_size", None),
-        maximum=getattr(args, "max_batch_size", None),
-        default=DEFAULT_EMBED_BATCH_SIZES,
-        sweep_fn=_build_embed_batch_sweep,
-    )
-    summary = _run_embed_batch_benchmark(
-        texts=texts,
-        config=config,
-        warmup=args.warmup,
-        requests=args.requests,
-        batch_size_sweep=batch_sizes,
-        recommend=recommend,
-        build_client=_build_client,
-    )
-    _write_embed_summary(summary, args.output_json)
+        batch_sizes, recommend = _resolve_sweep_levels(
+            single=getattr(args, "batch_size", None),
+            maximum=getattr(args, "max_batch_size", None),
+            default=DEFAULT_EMBED_BATCH_SIZES,
+            sweep_fn=_build_embed_batch_sweep,
+        )
+        summary = _run_embed_batch_benchmark(
+            texts=texts,
+            config=config,
+            warmup=args.warmup,
+            requests=args.requests,
+            batch_size_sweep=batch_sizes,
+            recommend=recommend,
+            build_client=_build_client,
+        )
+        _write_embed_summary(summary, args.output_json)
+    except (ImportError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
     return 0
