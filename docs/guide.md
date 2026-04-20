@@ -195,8 +195,8 @@ Input rows for `infermesh generate` may contain any of the following fields:
 Every file-backed run writes a checkpoint file alongside the output:
 
 ```
-results.jsonl        ← your output (human-readable)
-results.state.jsonl  ← checkpoint manifest (fingerprint + occurrence + status)
+results.jsonl             ← your output (human-readable)
+results.checkpoint.sqlite ← checkpoint file (resume state)
 ```
 
 If a long batch is interrupted (Ctrl-C, OOM, network loss), re-run with
@@ -210,7 +210,7 @@ infermesh generate \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
-# Resume — reads results.state.jsonl, skips settled items, appends the rest
+# Resume — reads results.checkpoint.sqlite, skips settled items, appends the rest
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
@@ -230,7 +230,7 @@ in-flight at that moment.
 Output rows within a window are written in completion order, not input order.
 Use the `_index` field to re-sort after the run if needed.
 
-`--resume` requires `--output-jsonl` and the matching `results.state.jsonl`
+`--resume` requires `--output-jsonl` and the matching `results.checkpoint.sqlite`
 checkpoint file from a previous file-backed run. If the checkpoint is missing,
 if the input and output paths are the same file, if the output file is missing
 any settled `_index` rows recorded in the checkpoint, or if the current input
@@ -272,7 +272,7 @@ def build_prompt(record: dict) -> dict:
 Extra keys beyond `"input"` and `"metadata"` are ignored. Mapper failures
 become per-item error rows — they do not abort the run. If you later resume a
 file-backed run, infermesh requires the same mapper implementation that wrote
-the original checkpoint manifest.
+the original checkpoint file.
 
 ## Generate Text
 

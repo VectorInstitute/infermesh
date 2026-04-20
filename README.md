@@ -174,14 +174,14 @@ infermesh generate \
 
 # Generate — from a JSONL file, results to another JSONL file
 # Each input line: {"prompt": "..."} or {"messages": [...]} or {"responses_input": "..."}
-# Output includes an _index field; a checkpoint manifest results.state.jsonl is kept.
+# Output includes an _index field; a checkpoint file results.checkpoint.sqlite is kept.
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
-# Resume an interrupted run — reads results.state.jsonl, skips settled rows, appends the rest
+# Resume an interrupted run — reads results.checkpoint.sqlite, skips settled rows, appends the rest
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
