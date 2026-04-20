@@ -374,10 +374,13 @@ def write_checkpoint_db(
     items: list[dict[str, Any]],
     *,
     mapping_fingerprint: str | None = None,
+    checkpoint_dir: str | None = None,
 ) -> Path:
     """Create a checkpoint DB for tests and populate it with explicit items."""
 
-    checkpoint_path = _checkpoint_path_for(str(output_path))
+    checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=checkpoint_dir
+    )
     connection = _connect_checkpoint_db(checkpoint_path)
     try:
         resolved_mapping_fingerprint = (

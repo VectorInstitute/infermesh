@@ -164,6 +164,7 @@ _SCHEMA_VERSION = 1
 _RUN_METADATA_SINGLETON = 1
 _ITEM_INSERT_BATCH_SIZE = 1000
 _STATUS_LOG_INTERVAL = 100_000
+_CHECKPOINT_PATH_HASH_LENGTH = 8
 
 _PENDING_STATUS = 0
 _SUCCESS_STATUS = 1
@@ -348,23 +349,53 @@ def _compute_parse_error_fingerprint(raw_line: str) -> bytes:
     return hashlib.sha256(f"__parse_error__{raw_line}".encode()).digest()
 
 
-def _checkpoint_path_for(output_jsonl: str) -> Path:
+def _checkpoint_path_for(
+    output_jsonl: str, *, checkpoint_dir: str | None = None
+) -> Path:
     """Derive the checkpoint file path from the output JSONL path.
 
     ``results.jsonl``  ->  ``results.checkpoint.sqlite``
     ``results``        ->  ``results.checkpoint.sqlite``
     """
     path = Path(output_jsonl)
-    if path.suffix == ".jsonl":
-        return path.with_name(path.stem + ".checkpoint.sqlite")
-    return path.with_name(path.name + ".checkpoint.sqlite")
+    checkpoint_stem = path.stem if path.suffix == ".jsonl" else path.name
+    if checkpoint_dir is None:
+        return path.with_name(checkpoint_stem + ".checkpoint.sqlite")
+
+    override_dir = Path(checkpoint_dir).expanduser()
+    override_dir.mkdir(parents=True, exist_ok=True)
+    resolved_output_path = path.expanduser().resolve(strict=False)
+    path_hash = hashlib.sha256(str(resolved_output_path).encode("utf-8")).hexdigest()[
+        :_CHECKPOINT_PATH_HASH_LENGTH
+    ]
+    return override_dir / f"{checkpoint_stem}.{path_hash}.checkpoint.sqlite"
+
+
+def _configure_checkpoint_journal_mode(connection: sqlite3.Connection) -> str:
+    """Configure the checkpoint DB for portable rollback journaling."""
+
+    persist_mode = connection.execute("PRAGMA journal_mode=PERSIST").fetchone()
+    journal_mode = str(persist_mode[0]).lower() if persist_mode is not None else ""
+    if journal_mode == "persist":
+        return journal_mode
+
+    delete_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+    journal_mode = str(delete_mode[0]).lower() if delete_mode is not None else ""
+    if journal_mode == "delete":
+        return journal_mode
+
+    raise RuntimeError(
+        "Checkpoint DB could not be configured for rollback journaling. "
+        f"SQLite reported journal_mode={journal_mode!r}."
+    )
 
 
 def _connect_checkpoint_db(checkpoint_path: Path) -> sqlite3.Connection:
     """Open a checkpoint database connection."""
 
     connection = sqlite3.connect(checkpoint_path)
-    connection.execute("PRAGMA journal_mode=WAL")  # crash-safe; allows concurrent reads
+    _configure_checkpoint_journal_mode(connection)
+    connection.execute("PRAGMA synchronous=FULL")
     connection.execute(
         "PRAGMA busy_timeout=5000"
     )  # retry briefly on write-lock contention
@@ -1326,6 +1357,7 @@ def run_generate_workflow(
     prompt: str | None,
     input_jsonl: str | None,
     output_jsonl: str | None,
+    checkpoint_dir: str | None,
     mapper_spec: str | None,
     resume: bool,
     endpoint: EndpointType,
@@ -1350,7 +1382,11 @@ def run_generate_workflow(
         effective_input_jsonl = str(staged_stdin_path)
 
     output_path = Path(output_jsonl) if output_jsonl else None
-    checkpoint_path = _checkpoint_path_for(output_jsonl) if output_jsonl else None
+    checkpoint_path = (
+        _checkpoint_path_for(output_jsonl, checkpoint_dir=checkpoint_dir)
+        if output_jsonl
+        else None
+    )
 
     persistence_sink: _FileBackedPersistenceSink | None = None
 

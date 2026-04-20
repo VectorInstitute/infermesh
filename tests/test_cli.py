@@ -191,6 +191,70 @@ def test_generate_no_resume_overwrites_existing_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("fake_client_builder")
+def test_generate_uses_checkpoint_dir_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "in.jsonl"
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_dir = tmp_path / "env-checkpoints"
+    input_path.write_text(json.dumps({"prompt": "hello"}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("INFERMESH_CHECKPOINT_DIR", str(checkpoint_dir))
+
+    exit_code = cli.main(
+        [
+            *_BASE_ARGS,
+            "--input-jsonl",
+            str(input_path),
+            "--output-jsonl",
+            str(output_path),
+        ]
+    )
+
+    checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=str(checkpoint_dir)
+    )
+    assert exit_code == 0
+    assert checkpoint_path.exists()
+    assert not _checkpoint_path_for(str(output_path)).exists()
+
+
+@pytest.mark.usefixtures("fake_client_builder")
+def test_generate_checkpoint_dir_flag_overrides_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "in.jsonl"
+    output_path = tmp_path / "out.jsonl"
+    env_checkpoint_dir = tmp_path / "env-checkpoints"
+    arg_checkpoint_dir = tmp_path / "arg-checkpoints"
+    input_path.write_text(json.dumps({"prompt": "hello"}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("INFERMESH_CHECKPOINT_DIR", str(env_checkpoint_dir))
+
+    exit_code = cli.main(
+        [
+            *_BASE_ARGS,
+            "--input-jsonl",
+            str(input_path),
+            "--output-jsonl",
+            str(output_path),
+            "--checkpoint-dir",
+            str(arg_checkpoint_dir),
+        ]
+    )
+
+    env_checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=str(env_checkpoint_dir)
+    )
+    arg_checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=str(arg_checkpoint_dir)
+    )
+    assert exit_code == 0
+    assert arg_checkpoint_path.exists()
+    assert not env_checkpoint_path.exists()
+
+
+@pytest.mark.usefixtures("fake_client_builder")
 def test_generate_rejects_identical_input_and_output_paths(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

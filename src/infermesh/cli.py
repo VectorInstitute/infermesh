@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -114,6 +115,13 @@ def _add_generate_parser(subparsers: Any) -> None:
     )
     generate_parser.add_argument(
         "--output-jsonl", help="Write one result object per input row."
+    )
+    generate_parser.add_argument(
+        "--checkpoint-dir",
+        help=(
+            "Optional directory for the checkpoint file. Defaults to the output "
+            "directory, or INFERMESH_CHECKPOINT_DIR when that env var is set."
+        ),
     )
     generate_parser.add_argument(
         "--endpoint",
@@ -343,6 +351,7 @@ def _handle_generate(args: argparse.Namespace) -> int:
 
     config = _client_config_from_args(args)
     window_size = config.max_parallel_requests or 128
+    checkpoint_dir = args.checkpoint_dir or os.getenv("INFERMESH_CHECKPOINT_DIR")
 
     # Use an open-ended progress bar for file-backed runs (total unknown up
     # front).  For a single --prompt to stdout, suppress it entirely.
@@ -366,6 +375,7 @@ def _handle_generate(args: argparse.Namespace) -> int:
                 prompt=args.prompt,
                 input_jsonl=args.input_jsonl,
                 output_jsonl=args.output_jsonl,
+                checkpoint_dir=checkpoint_dir,
                 mapper_spec=getattr(args, "mapper", None),
                 resume=resume,
                 endpoint=config.endpoint,

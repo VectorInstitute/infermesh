@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
 import sys
 import threading
 import types
@@ -160,6 +161,7 @@ def _run(
     *,
     input_path: Path | None = None,
     output_path: Path | None = None,
+    checkpoint_dir: str | None = None,
     prompt: str | None = None,
     mapper_spec: str | None = None,
     resume: bool = False,
@@ -172,6 +174,7 @@ def _run(
             prompt=prompt,
             input_jsonl=str(input_path) if input_path is not None else None,
             output_jsonl=str(output_path) if output_path is not None else None,
+            checkpoint_dir=checkpoint_dir,
             mapper_spec=mapper_spec,
             resume=resume,
             endpoint="chat_completion",
@@ -187,6 +190,15 @@ def _load_mapping_fingerprint(checkpoint_path: Path) -> str:
     try:
         _, mapping_fingerprint = _load_run_metadata(connection)
         return mapping_fingerprint
+    finally:
+        connection.close()
+
+
+def _load_checkpoint_journal_mode(checkpoint_path: Path) -> str:
+    connection = sqlite3.connect(checkpoint_path)
+    try:
+        row = connection.execute("PRAGMA journal_mode").fetchone()
+        return str(row[0]).lower() if row is not None else ""
     finally:
         connection.close()
 
@@ -209,6 +221,40 @@ def test_file_backed_generate_streams_input(tmp_path: Path) -> None:
 
     out_rows = _read_output(output_path)
     assert len(out_rows) == 7
+
+
+def test_default_checkpoint_uses_portable_rollback_journaling(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    client = _FakeClient()
+
+    _run(client, input_path=input_path, output_path=output_path)
+
+    assert checkpoint_path.exists()
+    assert _load_checkpoint_journal_mode(checkpoint_path) in {"persist", "delete"}
+    assert not Path(f"{checkpoint_path}-wal").exists()
+    assert not Path(f"{checkpoint_path}-shm").exists()
+
+
+def test_checkpoint_override_disambiguates_same_output_basename(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    output_a = tmp_path / "run-a" / "out.jsonl"
+    output_b = tmp_path / "run-b" / "out.jsonl"
+
+    checkpoint_a = _checkpoint_path_for(
+        str(output_a), checkpoint_dir=str(checkpoint_dir)
+    )
+    checkpoint_b = _checkpoint_path_for(
+        str(output_b), checkpoint_dir=str(checkpoint_dir)
+    )
+
+    assert checkpoint_a.parent == checkpoint_dir
+    assert checkpoint_b.parent == checkpoint_dir
+    assert checkpoint_a != checkpoint_b
+    assert checkpoint_a.name.startswith("out.")
+    assert checkpoint_b.name.startswith("out.")
 
 
 def test_generate_workflow_supports_running_event_loop(tmp_path: Path) -> None:
@@ -287,6 +333,74 @@ def test_resume_skips_settled_rows(tmp_path: Path) -> None:
 
     state = load_resume_state(checkpoint_path)
     assert {row["status"] for row in state.values()} == {"success"}
+
+
+def test_resume_reuses_checkpoint_dir_override(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_dir = tmp_path / "scratch-checkpoints"
+    checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=str(checkpoint_dir)
+    )
+
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1, status="pending"
+            ),
+            checkpoint_item_for_record(
+                rows[2], occurrence=0, index=2, status="pending"
+            ),
+        ],
+        checkpoint_dir=str(checkpoint_dir),
+    )
+
+    client = _FakeClient()
+    _run(
+        client,
+        input_path=input_path,
+        output_path=output_path,
+        checkpoint_dir=str(checkpoint_dir),
+        resume=True,
+    )
+
+    rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
+    assert rows_by_index[0]["output_text"] == "cached-a"
+    assert rows_by_index[1]["output_text"] == "out:b"
+    assert rows_by_index[2]["output_text"] == "out:c"
+
+    state = load_resume_state(checkpoint_path)
+    assert {row["status"] for row in state.values()} == {"success"}
+
+
+def test_resume_requires_same_checkpoint_dir_override(tmp_path: Path) -> None:
+    row = {"prompt": "a"}
+    input_path = _write_input(tmp_path, [row])
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_dir = tmp_path / "scratch-checkpoints"
+
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [checkpoint_item_for_record(row, occurrence=0, index=0, status="success")],
+        checkpoint_dir=str(checkpoint_dir),
+    )
+
+    client = _FakeClient()
+    with pytest.raises(ValueError, match="requires checkpoint file"):
+        _run(client, input_path=input_path, output_path=output_path, resume=True)
 
 
 def test_builtin_row_conventions(tmp_path: Path) -> None:
