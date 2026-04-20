@@ -8,8 +8,9 @@ import logging
 import threading
 import time
 import weakref
+from collections.abc import Coroutine
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlparse
 
 from infermesh._utils import (
@@ -36,6 +37,7 @@ _RoutingStrategy = Literal[
     "cost-based-routing",
     "usage-based-routing-v2",
 ]
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
@@ -196,6 +198,11 @@ class _ClientRuntimeMixin:
         self._round_robin_index = 0
         self._deployments = self._coerce_deployments(deployments)
         self._closed = False
+
+    def _run_sync(self, coroutine: Coroutine[Any, Any, T]) -> T:
+        """Run a coroutine on the client-owned background event loop."""
+
+        return self._sync_runner.run(coroutine)
 
     async def _dispatch_with_controls(
         self,

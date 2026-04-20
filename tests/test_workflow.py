@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sys
@@ -21,6 +22,7 @@ from infermesh._workflow import (
     _load_run_metadata,
     run_generate_workflow,
 )
+from infermesh.sync_runner import SyncRunner
 from tests.fakes import (
     checkpoint_item_for_parse_error,
     checkpoint_item_for_record,
@@ -42,43 +44,96 @@ class _FakeResult:
 
 
 class _FakeClient:
-    """Synchronous fake that records generate_batch calls and fires on_result."""
+    """Async fake that records workflow admissions one item at a time."""
 
     def __init__(self) -> None:
-        self.batches: list[list[Any]] = []
+        self._sync_runner = SyncRunner()
+        self.inputs: list[Any] = []
+        self.active = 0
+        self.peak_active = 0
 
-    def generate_batch(self, input_batch: list[Any], **kwargs: Any) -> None:
-        self.batches.append(list(input_batch))
-        on_result = kwargs.get("on_result")
-        if on_result is not None:
-            for idx, item in enumerate(input_batch):
-                on_result(idx, _FakeResult(output_text=f"out:{item}"), None)
+    def _run_sync(self, coroutine: Any) -> Any:
+        return self._sync_runner.run(coroutine)
+
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> _FakeResult:
+        self.inputs.append(input_data)
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            await asyncio.sleep(0)
+            return _FakeResult(output_text=f"out:{input_data}")
+        finally:
+            self.active -= 1
 
     def close(self) -> None:
-        pass
+        self._sync_runner.close()
 
 
-class _ThreadedCallbackFakeClient(_FakeClient):
-    """Fake client that fires callbacks from a non-caller thread."""
+class _RollingWindowFakeClient(_FakeClient):
+    """Fake client that exposes whether the workflow refilled before a slow item ended."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.callback_thread_ids: list[int] = []
+        self.tail_started_before_slow_finished = False
+        self._allow_slow_finish: asyncio.Event | None = None
 
-    def generate_batch(self, input_batch: list[Any], **kwargs: Any) -> None:
-        self.batches.append(list(input_batch))
-        on_result = kwargs.get("on_result")
-        if on_result is None:
-            return
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> _FakeResult:
+        self.inputs.append(input_data)
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            if self._allow_slow_finish is None:
+                self._allow_slow_finish = asyncio.Event()
+            if input_data == "slow":
+                await asyncio.wait_for(self._allow_slow_finish.wait(), timeout=1.0)
+            else:
+                await asyncio.sleep(0)
+                if input_data == "tail-1":
+                    self.tail_started_before_slow_finished = True
+                    self._allow_slow_finish.set()
+            return _FakeResult(output_text=f"out:{input_data}")
+        finally:
+            self.active -= 1
 
-        def worker() -> None:
-            self.callback_thread_ids.append(threading.get_ident())
-            for idx, item in enumerate(input_batch):
-                on_result(idx, _FakeResult(output_text=f"out:{item}"), None)
 
-        thread = threading.Thread(target=worker, name="test-workflow-callback")
-        thread.start()
-        thread.join()
+class _SelectiveFailingFakeClient(_FakeClient):
+    """Fake client that fails selected prompts while letting siblings continue."""
+
+    def __init__(self, *, failing_inputs: set[Any]) -> None:
+        super().__init__()
+        self._failing_inputs = set(failing_inputs)
+
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> _FakeResult:
+        self.inputs.append(input_data)
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            await asyncio.sleep(0)
+            if input_data in self._failing_inputs:
+                raise RuntimeError(f"boom:{input_data}")
+            return _FakeResult(output_text=f"out:{input_data}")
+        finally:
+            self.active -= 1
+
+
+class _MapperSignalFakeClient(_FakeClient):
+    """Fake client that signals when a specific mapped input has completed."""
+
+    def __init__(self, *, release_event: threading.Event) -> None:
+        super().__init__()
+        self._release_event = release_event
+
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> _FakeResult:
+        self.inputs.append(input_data)
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            await asyncio.sleep(0)
+            if input_data == "first":
+                self._release_event.set()
+            return _FakeResult(output_text=f"out:{input_data}")
+        finally:
+            self.active -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -111,17 +166,20 @@ def _run(
     window_size: int = 128,
     parse_json: bool = False,
 ) -> None:
-    run_generate_workflow(
-        client,  # type: ignore[arg-type]
-        prompt=prompt,
-        input_jsonl=str(input_path) if input_path is not None else None,
-        output_jsonl=str(output_path) if output_path is not None else None,
-        mapper_spec=mapper_spec,
-        resume=resume,
-        endpoint="chat_completion",
-        window_size=window_size,
-        parse_json=parse_json,
-    )
+    try:
+        run_generate_workflow(
+            client,  # type: ignore[arg-type]
+            prompt=prompt,
+            input_jsonl=str(input_path) if input_path is not None else None,
+            output_jsonl=str(output_path) if output_path is not None else None,
+            mapper_spec=mapper_spec,
+            resume=resume,
+            endpoint="chat_completion",
+            window_size=window_size,
+            parse_json=parse_json,
+        )
+    finally:
+        client.close()
 
 
 def _load_mapping_fingerprint(checkpoint_path: Path) -> str:
@@ -146,37 +204,54 @@ def test_file_backed_generate_streams_input(tmp_path: Path) -> None:
 
     _run(client, input_path=input_path, output_path=output_path, window_size=3)
 
-    # 7 items, window_size=3 → batches of [3, 3, 1]
-    assert len(client.batches) == 3
-    assert all(len(b) <= 3 for b in client.batches)
-    assert sum(len(b) for b in client.batches) == 7
+    assert client.inputs == [f"p{i}" for i in range(7)]
+    assert client.peak_active <= 3
 
     out_rows = _read_output(output_path)
     assert len(out_rows) == 7
 
 
-def test_file_backed_generate_persists_threaded_callbacks(tmp_path: Path) -> None:
-    rows = [{"prompt": "a"}, {"prompt": "b"}]
+def test_generate_workflow_supports_running_event_loop(tmp_path: Path) -> None:
+    rows = [{"prompt": "hello"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    client = _FakeClient()
+
+    async def invoke_workflow() -> None:
+        _run(client, input_path=input_path, output_path=output_path)
+
+    asyncio.run(invoke_workflow())
+
+    assert _read_output(output_path)[0]["output_text"] == "out:hello"
+
+
+def test_file_backed_generate_refills_window_as_items_finish(tmp_path: Path) -> None:
+    rows = [
+        {"prompt": "slow"},
+        {"prompt": "fast-1"},
+        {"prompt": "fast-2"},
+        {"prompt": "tail-1"},
+        {"prompt": "tail-2"},
+    ]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
     checkpoint_path = _checkpoint_path_for(str(output_path))
-    client = _ThreadedCallbackFakeClient()
+    client = _RollingWindowFakeClient()
 
-    _run(client, input_path=input_path, output_path=output_path)
+    _run(client, input_path=input_path, output_path=output_path, window_size=3)
 
-    assert client.batches == [["a", "b"]]
-    assert len(client.callback_thread_ids) == 1
-    assert client.callback_thread_ids[0] != threading.get_ident()
+    assert client.peak_active <= 3
+    assert client.tail_started_before_slow_finished
 
     out_rows = _read_output(output_path)
-    assert [row["output_text"] for row in out_rows] == ["out:a", "out:b"]
+    assert len(out_rows) == 5
 
     state = load_resume_state(checkpoint_path)
-    assert len(state) == 2
+    assert len(state) == 5
     assert {row["status"] for row in state.values()} == {"success"}
 
 
-def test_resume_skips_settled_rows_with_threaded_callbacks(tmp_path: Path) -> None:
+def test_resume_skips_settled_rows(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
@@ -201,11 +276,10 @@ def test_resume_skips_settled_rows_with_threaded_callbacks(tmp_path: Path) -> No
         ],
     )
 
-    client = _ThreadedCallbackFakeClient()
+    client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
 
-    all_inputs = [item for batch in client.batches for item in batch]
-    assert all_inputs == ["b", "c"]
+    assert client.inputs == ["b", "c"]
 
     rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
     assert rows_by_index[1]["output_text"] == "out:b"
@@ -227,8 +301,11 @@ def test_builtin_row_conventions(tmp_path: Path) -> None:
 
     _run(client, input_path=input_path, output_path=output_path)
 
-    assert len(client.batches) == 1
-    assert len(client.batches[0]) == 3
+    assert client.inputs == [
+        "hello",
+        [{"role": "user", "content": "hi"}],
+        [{"role": "user", "content": "hey"}],
+    ]
     out_rows = _read_output(output_path)
     assert len(out_rows) == 3
     assert all(r["error"] is None for r in out_rows)
@@ -258,12 +335,48 @@ def test_mapper_import_and_metadata(tmp_path: Path) -> None:
             mapper_spec="_test_wf_mapper_mod:my_mapper",
         )
 
-        assert client.batches == [["HELLO"]]
+        assert client.inputs == ["HELLO"]
         out_rows = _read_output(output_path)
         assert out_rows[0]["metadata"] == {"original": "hello"}
         assert out_rows[0]["error"] is None
     finally:
         del sys.modules["_test_wf_mapper_mod"]
+
+
+def test_mapper_waiting_on_generation_progress_does_not_block_loop(
+    tmp_path: Path,
+) -> None:
+    fake_mod = types.ModuleType("_test_wf_waiting_mapper_mod")
+    release_event = threading.Event()
+    client = _MapperSignalFakeClient(release_event=release_event)
+
+    def waiting_mapper(record: dict[str, Any]) -> dict[str, Any]:
+        if record["prompt"] == "second" and not release_event.wait(timeout=1.0):
+            raise RuntimeError("mapper never observed first completion")
+        return {"input": record["prompt"]}
+
+    fake_mod.waiting_mapper = waiting_mapper  # type: ignore[attr-defined]
+    sys.modules["_test_wf_waiting_mapper_mod"] = fake_mod
+    try:
+        rows = [{"prompt": "first"}, {"prompt": "second"}]
+        input_path = _write_input(tmp_path, rows)
+        output_path = tmp_path / "out.jsonl"
+
+        _run(
+            client,
+            input_path=input_path,
+            output_path=output_path,
+            mapper_spec="_test_wf_waiting_mapper_mod:waiting_mapper",
+            window_size=2,
+        )
+
+        rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
+        assert rows_by_index[0]["output_text"] == "out:first"
+        assert rows_by_index[0]["error"] is None
+        assert rows_by_index[1]["output_text"] == "out:second"
+        assert rows_by_index[1]["error"] is None
+    finally:
+        del sys.modules["_test_wf_waiting_mapper_mod"]
 
 
 def test_mapper_ignores_extra_keys(tmp_path: Path) -> None:
@@ -315,8 +428,8 @@ def test_mapper_validation_failure_becomes_error_row(tmp_path: Path) -> None:
             mapper_spec="_test_wf_bad_mapper_mod:bad_mapper",
         )
 
-        # Both rows become error rows; generate_batch is never called
-        assert client.batches == []
+        # Both rows become error rows; no generation request is started.
+        assert client.inputs == []
         out_rows = _read_output(output_path)
         assert len(out_rows) == 2
         assert all(r["output_text"] is None for r in out_rows)
@@ -333,7 +446,7 @@ def test_builtin_mapping_failure_becomes_error_row(tmp_path: Path) -> None:
 
     _run(client, input_path=input_path, output_path=output_path)
 
-    assert client.batches == []
+    assert client.inputs == []
     out_rows = _read_output(output_path)
     assert len(out_rows) == 1
     assert out_rows[0]["output_text"] is None
@@ -365,6 +478,32 @@ def test_malformed_json_line_becomes_error_row(tmp_path: Path) -> None:
     assert success_rows[0]["output_text"] is not None
 
 
+def test_provider_failure_becomes_error_row_and_settles_checkpoint(
+    tmp_path: Path,
+) -> None:
+    rows = [{"prompt": "good"}, {"prompt": "bad"}, {"prompt": "also-good"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    client = _SelectiveFailingFakeClient(failing_inputs={"bad"})
+
+    _run(client, input_path=input_path, output_path=output_path, window_size=2)
+
+    rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
+    assert rows_by_index[0]["output_text"] == "out:good"
+    assert rows_by_index[0]["error"] is None
+    assert rows_by_index[1]["output_text"] is None
+    assert rows_by_index[1]["error"] == "boom:bad"
+    assert rows_by_index[2]["output_text"] == "out:also-good"
+    assert rows_by_index[2]["error"] is None
+
+    state = load_resume_state(checkpoint_path)
+    assert {row["status"] for row in state.values()} == {"success", "error"}
+    failed_item = next(row for row in state.values() if row["_index"] == 1)
+    assert failed_item["status"] == "error"
+    assert failed_item["error"] == "boom:bad"
+
+
 def test_fresh_run_bootstrap_failure_preserves_existing_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -392,7 +531,7 @@ def test_fresh_run_bootstrap_failure_preserves_existing_artifacts(
 
     assert output_path.read_text(encoding="utf-8") == old_output
     assert checkpoint_path.read_bytes() == old_checkpoint
-    assert client.batches == []
+    assert client.inputs == []
 
 
 def test_resume_skips_items_from_checkpoint_file(tmp_path: Path) -> None:
@@ -429,8 +568,7 @@ def test_resume_skips_items_from_checkpoint_file(tmp_path: Path) -> None:
     client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
 
-    all_inputs = [item for batch in client.batches for item in batch]
-    assert all_inputs == ["b"]
+    assert client.inputs == ["b"]
 
 
 def test_resume_requires_state_file(tmp_path: Path) -> None:
@@ -540,8 +678,7 @@ def test_resume_tracks_duplicate_records_independently(tmp_path: Path) -> None:
     client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
 
-    all_inputs = [item for batch in client.batches for item in batch]
-    assert all_inputs == ["dup", "tail"]
+    assert client.inputs == ["dup", "tail"]
     rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
     assert rows_by_index[1]["output_text"] == "out:dup"
     assert rows_by_index[2]["output_text"] == "out:tail"
@@ -637,7 +774,7 @@ def test_resume_allows_empty_custom_mapper_checkpoint(tmp_path: Path) -> None:
         checkpoint_path = _checkpoint_path_for(str(output_path))
         assert output_path.read_text(encoding="utf-8") == ""
         assert load_resume_state(checkpoint_path) == {}
-        assert resume_client.batches == []
+        assert resume_client.inputs == []
     finally:
         del sys.modules["_test_wf_empty_mapper_mod"]
 
@@ -678,8 +815,7 @@ def test_resume_preserves_original_indexes_after_reorder(tmp_path: Path) -> None
     client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
 
-    all_inputs = [item for batch in client.batches for item in batch]
-    assert all_inputs == ["c", "b"]
+    assert client.inputs == ["c", "b"]
     rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
     assert rows_by_index[1]["output_text"] == "out:b"
     assert rows_by_index[2]["output_text"] == "out:c"
@@ -794,7 +930,7 @@ def test_resume_tracks_duplicate_parse_errors_by_occurrence(tmp_path: Path) -> N
     client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
 
-    assert client.batches == [["good"]]
+    assert client.inputs == ["good"]
     rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
     assert rows_by_index[1]["output_text"] == "out:good"
     assert rows_by_index[2]["output_text"] is None
@@ -850,7 +986,7 @@ def test_invalid_metadata_becomes_error_row_without_aborting_siblings(
             mapper_spec="_test_wf_metadata_mod:my_mapper",
         )
 
-        assert client.batches == [["good"]]
+        assert client.inputs == ["good"]
         out_rows = _read_output(output_path)
         assert len(out_rows) == 2
         rows_by_index = {row["_index"]: row for row in out_rows}

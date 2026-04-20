@@ -374,7 +374,7 @@ def _handle_generate(args: argparse.Namespace) -> int:
                 on_progress=lambda: bar.update(),  # noqa: PLW0108
                 on_status=report_status,
             )
-    except (ImportError, ValueError) as exc:
+    except Exception as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
     return 0

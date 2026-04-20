@@ -18,6 +18,7 @@ from infermesh._workflow import (
     _initialize_checkpoint_db,
 )
 from infermesh.client import LMClient
+from infermesh.sync_runner import SyncRunner
 from infermesh.types import (
     BatchResult,
     EmbeddingResult,
@@ -196,18 +197,44 @@ class ToolCallingFakeLiteLLM(FakeLiteLLM):
 class FakeCLIClient:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self._sync_runner = SyncRunner()
         self.closed = False
         self.embed_batch_sizes: list[int] = []
         self.embed_micro_batch_sizes: list[int | None] = []
+        self.generate_inputs: list[Any] = []
+
+    def _run_sync(self, coroutine: Any) -> Any:
+        return self._sync_runner.run(coroutine)
 
     def close(self) -> None:
+        self._sync_runner.close()
         self.closed = True
 
     def generate(self, input_data: Any, **kwargs: Any) -> GenerationResult:
+        self.generate_inputs.append(input_data)
         return GenerationResult(
             model_id="test-model",
             output_text=f"generated:{input_data}",
             request_id="req-1",
+        )
+
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> GenerationResult:
+        self.generate_inputs.append(input_data)
+        return GenerationResult(
+            model_id="test-model",
+            output_text=f"generated:{input_data}",
+            request_id="req-1",
+            token_usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
+            metrics=RequestMetrics(
+                queue_wait_s=0.01,
+                service_time_s=0.02,
+                end_to_end_s=0.03,
+                deployment="replica-1",
+            ),
         )
 
     def generate_batch(

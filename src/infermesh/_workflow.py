@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import importlib
@@ -12,11 +13,13 @@ import sqlite3
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, cast
 
+from infermesh._batch_utils import cancel_tasks
 from infermesh._cli_support import _build_generation_record, _write_jsonl
 
 if TYPE_CHECKING:
@@ -32,6 +35,24 @@ class _WorkItem:
     checkpoint_key: tuple[bytes, int]
     mapped_input: Any
     metadata: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _PreparedWorkItem:
+    """One source row after resume/mapping validation."""
+
+    output_index: int
+    checkpoint_key: tuple[bytes, int]
+    work_item: _WorkItem | None
+    immediate_error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class _SourceExhausted:
+    """Sentinel returned when the blocking source preparer is out of rows."""
+
+
+_SOURCE_EXHAUSTED = _SourceExhausted()
 
 
 @dataclass
@@ -70,6 +91,73 @@ class _PersistenceShutdown:
     """Signal the sink thread to flush and stop."""
 
     done: threading.Event
+
+
+class _BlockingWorkItemPreparer:
+    """Prepare source rows on one blocking worker thread."""
+
+    def __init__(
+        self,
+        *,
+        prompt: str | None,
+        input_jsonl: str | None,
+        resume: bool,
+        checkpoint_path: Path | None,
+        mapper: Callable[[dict[str, Any]], Any] | None,
+    ) -> None:
+        self._prompt = prompt
+        self._input_jsonl = input_jsonl
+        self._resume = resume
+        self._checkpoint_path = checkpoint_path
+        self._mapper = mapper
+        self._source_rows: (
+            Generator[tuple[_SourceRow, tuple[bytes, int]], None, None] | None
+        ) = None
+        self._checkpoint_connection: sqlite3.Connection | None = None
+
+    def next_prepared(self) -> _PreparedWorkItem | _SourceExhausted:
+        """Return the next schedulable work item or source exhaustion sentinel."""
+
+        self._ensure_open()
+        assert self._source_rows is not None
+        for source_row, checkpoint_key in self._source_rows:
+            prepared = _prepare_generate_work_item(
+                source_row=source_row,
+                checkpoint_key=checkpoint_key,
+                resume=self._resume,
+                checkpoint_connection=self._checkpoint_connection,
+                mapper=self._mapper,
+            )
+            if prepared is not None:
+                return prepared
+        return _SOURCE_EXHAUSTED
+
+    def close(self) -> None:
+        """Release any blocking-thread resources held by the preparer."""
+
+        if self._source_rows is not None:
+            self._source_rows.close()
+            self._source_rows = None
+        if self._checkpoint_connection is not None:
+            self._checkpoint_connection.close()
+            self._checkpoint_connection = None
+
+    def _ensure_open(self) -> None:
+        """Lazily initialize iterator and resume connection on the worker thread."""
+
+        if self._source_rows is None:
+            self._source_rows = cast(
+                Generator[tuple[_SourceRow, tuple[bytes, int]], None, None],
+                _iter_source_rows_with_keys(
+                    prompt=self._prompt,
+                    input_jsonl=self._input_jsonl,
+                ),
+            )
+        if not self._resume or self._checkpoint_connection is not None:
+            return
+        if self._checkpoint_path is None:
+            raise RuntimeError("Resume path requires a checkpoint file path.")
+        self._checkpoint_connection = _connect_checkpoint_db(self._checkpoint_path)
 
 
 _SCHEMA_VERSION = 1
@@ -769,7 +857,7 @@ def _validate_resume_source(
         raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
 
 
-def _open_resume_checkpoint(
+def _validate_resume_checkpoint(
     output_path: Path,
     checkpoint_path: Path,
     *,
@@ -777,8 +865,8 @@ def _open_resume_checkpoint(
     prompt: str | None,
     input_jsonl: str | None,
     on_status: Callable[[str], Any] | None = None,
-) -> sqlite3.Connection:
-    """Open and validate the resume checkpoint for a file-backed workflow."""
+) -> None:
+    """Validate the resume checkpoint for a file-backed workflow."""
 
     if not checkpoint_path.exists():
         raise ValueError(
@@ -806,10 +894,8 @@ def _open_resume_checkpoint(
             input_jsonl=input_jsonl,
             on_status=on_status,
         )
-    except BaseException:
+    finally:
         connection.close()
-        raise
-    return connection
 
 
 def _load_mapper(mapper_spec: str) -> Callable[[dict[str, Any]], Any]:
@@ -924,42 +1010,50 @@ def _write_item_result(
     return record
 
 
-def _flush_window(
+async def _agenerate_work_item(
     client: LMClient,
-    window: list[_WorkItem],
-    persistence_sink: _FileBackedPersistenceSink | None,
+    item: _WorkItem,
+    *,
     endpoint: EndpointType,
+) -> tuple[Any, Exception | None]:
+    """Run one workflow item and return its settled outcome."""
+
+    try:
+        result = await client.agenerate(
+            item.mapped_input,
+            endpoint=endpoint,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return None, exc
+    return result, None
+
+
+def _emit_settled_work_item(
+    persistence_sink: _FileBackedPersistenceSink | None,
+    item: _WorkItem,
+    result: Any,
+    error: BaseException | None,
+    *,
     parse_json: bool,
     on_progress: Callable[[], Any] | None,
-) -> list[dict[str, Any]]:
-    """Execute one window of work through ``generate_batch`` and write results."""
+) -> None:
+    """Persist or print one settled workflow item, then tick progress."""
 
-    inputs = [item.mapped_input for item in window]
-    stdout_rows: list[dict[str, Any]] = []
-
-    def on_result(batch_idx: int, result: Any, error: BaseException | None) -> None:
-        item = window[batch_idx]
-        record = _write_item_result(
-            persistence_sink,
-            item.output_index,
-            item.checkpoint_key,
-            result,
-            error,
-            metadata=item.metadata,
-            parse_json=parse_json,
-        )
-        if persistence_sink is None:
-            stdout_rows.append(record)
-        if on_progress is not None:
-            on_progress()
-
-    client.generate_batch(
-        inputs,
-        endpoint=endpoint,
-        return_exceptions=True,
-        on_result=on_result,
+    record = _write_item_result(
+        persistence_sink,
+        item.output_index,
+        item.checkpoint_key,
+        result,
+        error,
+        metadata=item.metadata,
+        parse_json=parse_json,
     )
-    return stdout_rows
+    if persistence_sink is None:
+        _write_jsonl([record], None)
+    if on_progress is not None:
+        on_progress()
 
 
 def _emit_immediate_error(
@@ -988,6 +1082,70 @@ def _emit_immediate_error(
         on_progress()
 
 
+def _prepare_generate_work_item(
+    *,
+    source_row: _SourceRow,
+    checkpoint_key: tuple[bytes, int],
+    resume: bool,
+    checkpoint_connection: sqlite3.Connection | None,
+    mapper: Callable[[dict[str, Any]], Any] | None,
+) -> _PreparedWorkItem | None:
+    """Convert one source row into schedulable work or an immediate error."""
+
+    output_index = _generate_output_index_for_resume_row(
+        resume=resume,
+        checkpoint_connection=checkpoint_connection,
+        checkpoint_key=checkpoint_key,
+        source_index=source_row.source_index,
+    )
+    if output_index is None:
+        return None
+
+    if source_row.error is not None:
+        return _PreparedWorkItem(
+            output_index=output_index,
+            checkpoint_key=checkpoint_key,
+            work_item=None,
+            immediate_error=source_row.error,
+        )
+
+    raw_record = source_row.raw_record
+    if raw_record is None:
+        raise RuntimeError(
+            "Invariant violated: source_row.raw_record is None after error check."
+        )
+
+    mapping_result = _apply_mapper_or_builtin(raw_record, mapper)
+    if isinstance(mapping_result, Exception):
+        return _PreparedWorkItem(
+            output_index=output_index,
+            checkpoint_key=checkpoint_key,
+            work_item=None,
+            immediate_error=mapping_result,
+        )
+
+    mapped_input, metadata = mapping_result
+    metadata_result = _validate_metadata(metadata)
+    if isinstance(metadata_result, Exception):
+        return _PreparedWorkItem(
+            output_index=output_index,
+            checkpoint_key=checkpoint_key,
+            work_item=None,
+            immediate_error=metadata_result,
+        )
+
+    return _PreparedWorkItem(
+        output_index=output_index,
+        checkpoint_key=checkpoint_key,
+        work_item=_WorkItem(
+            output_index=output_index,
+            checkpoint_key=checkpoint_key,
+            mapped_input=mapped_input,
+            metadata=metadata_result,
+        ),
+    )
+
+
 def _generate_output_index_for_resume_row(
     *,
     resume: bool,
@@ -1009,13 +1167,101 @@ def _generate_output_index_for_resume_row(
     return checkpoint_item.output_index
 
 
+async def _arun_generate_source_rows(
+    client: LMClient,
+    *,
+    preparer: _BlockingWorkItemPreparer,
+    preparer_executor: ThreadPoolExecutor,
+    resume: bool,
+    persistence_sink: _FileBackedPersistenceSink | None,
+    window_size: int,
+    endpoint: EndpointType,
+    parse_json: bool,
+    on_progress: Callable[[], Any] | None,
+) -> None:
+    """Stream mapped rows through a rolling in-flight generation window."""
+
+    if window_size < 1:
+        raise ValueError("window_size must be a positive integer.")
+
+    loop = asyncio.get_running_loop()
+    active_tasks: dict[asyncio.Task[tuple[Any, Exception | None]], _WorkItem] = {}
+    source_exhausted = False
+    any_work = False
+
+    async def fill_window() -> None:
+        nonlocal source_exhausted
+        nonlocal any_work
+
+        while len(active_tasks) < window_size and not source_exhausted:
+            prepared = await loop.run_in_executor(
+                preparer_executor,
+                preparer.next_prepared,
+            )
+            if isinstance(prepared, _SourceExhausted):
+                source_exhausted = True
+                return
+            any_work = True
+            if prepared.immediate_error is not None:
+                _emit_immediate_error(
+                    persistence_sink,
+                    prepared.output_index,
+                    prepared.checkpoint_key,
+                    prepared.immediate_error,
+                    parse_json=parse_json,
+                    on_progress=on_progress,
+                )
+                continue
+
+            work_item = prepared.work_item
+            assert work_item is not None
+            # This helper runs inside `_arun_generate_source_rows`, so the
+            # current event loop is already active when we admit a new task.
+            task = asyncio.create_task(
+                _agenerate_work_item(
+                    client,
+                    work_item,
+                    endpoint=endpoint,
+                )
+            )
+            active_tasks[task] = work_item
+
+    try:
+        await fill_window()
+        while active_tasks:
+            done, _ = await asyncio.wait(
+                active_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                item = active_tasks.pop(task)
+                result, error = task.result()
+                _emit_settled_work_item(
+                    persistence_sink,
+                    item,
+                    result,
+                    error,
+                    parse_json=parse_json,
+                    on_progress=on_progress,
+                )
+            await fill_window()
+    except BaseException:
+        await cancel_tasks(list(active_tasks))
+        raise
+    finally:
+        await loop.run_in_executor(preparer_executor, preparer.close)
+
+    if resume and not any_work:
+        sys.stderr.write("Nothing to do — all rows already completed.\n")
+
+
 def _run_generate_source_rows(
     client: LMClient,
     *,
     prompt: str | None,
     effective_input_jsonl: str | None,
     resume: bool,
-    checkpoint_connection: sqlite3.Connection | None,
+    checkpoint_path: Path | None,
     persistence_sink: _FileBackedPersistenceSink | None,
     mapper: Callable[[dict[str, Any]], Any] | None,
     window_size: int,
@@ -1023,108 +1269,37 @@ def _run_generate_source_rows(
     parse_json: bool,
     on_progress: Callable[[], Any] | None,
 ) -> None:
-    """Stream mapped rows into ``generate_batch`` windows."""
+    """Run the rolling generate scheduler on the client's background loop."""
 
-    window: list[_WorkItem] = []
-    any_work = False
-
-    for source_row, checkpoint_key in _iter_source_rows_with_keys(
-        prompt=prompt, input_jsonl=effective_input_jsonl
-    ):
-        output_index = _generate_output_index_for_resume_row(
-            resume=resume,
-            checkpoint_connection=checkpoint_connection,
-            checkpoint_key=checkpoint_key,
-            source_index=source_row.source_index,
-        )
-        if output_index is None:
-            continue
-
-        any_work = True
-
-        if source_row.error is not None:
-            _emit_immediate_error(
-                persistence_sink,
-                output_index,
-                checkpoint_key,
-                source_row.error,
-                parse_json=parse_json,
-                on_progress=on_progress,
-            )
-            continue
-
-        raw_record = source_row.raw_record
-        if raw_record is None:
-            raise RuntimeError(
-                "Invariant violated: source_row.raw_record is None after error check."
-            )
-
-        mapping_result = _apply_mapper_or_builtin(raw_record, mapper)
-        if isinstance(mapping_result, Exception):
-            _emit_immediate_error(
-                persistence_sink,
-                output_index,
-                checkpoint_key,
-                mapping_result,
-                parse_json=parse_json,
-                on_progress=on_progress,
-            )
-            continue
-
-        mapped_input, metadata = mapping_result
-        metadata_result = _validate_metadata(metadata)
-        if isinstance(metadata_result, Exception):
-            _emit_immediate_error(
-                persistence_sink,
-                output_index,
-                checkpoint_key,
-                metadata_result,
-                parse_json=parse_json,
-                on_progress=on_progress,
-            )
-            continue
-        window.append(
-            _WorkItem(
-                output_index=output_index,
-                checkpoint_key=checkpoint_key,
-                mapped_input=mapped_input,
-                metadata=metadata_result,
-            )
-        )
-
-        if len(window) >= window_size:
-            stdout_rows = _flush_window(
+    preparer = _BlockingWorkItemPreparer(
+        prompt=prompt,
+        input_jsonl=effective_input_jsonl,
+        resume=resume,
+        checkpoint_path=checkpoint_path,
+        mapper=mapper,
+    )
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="infermesh-generate-prep",
+    ) as preparer_executor:
+        client._run_sync(
+            _arun_generate_source_rows(
                 client,
-                window,
-                persistence_sink,
-                endpoint,
-                parse_json,
-                on_progress,
+                preparer=preparer,
+                preparer_executor=preparer_executor,
+                resume=resume,
+                persistence_sink=persistence_sink,
+                window_size=window_size,
+                endpoint=endpoint,
+                parse_json=parse_json,
+                on_progress=on_progress,
             )
-            if stdout_rows:
-                _write_jsonl(stdout_rows, None)
-            window.clear()
-
-    if window:
-        stdout_rows = _flush_window(
-            client,
-            window,
-            persistence_sink,
-            endpoint,
-            parse_json,
-            on_progress,
         )
-        if stdout_rows:
-            _write_jsonl(stdout_rows, None)
-
-    if resume and not any_work:
-        sys.stderr.write("Nothing to do — all rows already completed.\n")
 
 
 def _cleanup_generate_workflow_resources(
     *,
     persistence_sink: _FileBackedPersistenceSink | None,
-    checkpoint_connection: sqlite3.Connection | None,
     staged_stdin_path: Path | None,
 ) -> None:
     """Release workflow resources and re-raise the first cleanup failure."""
@@ -1133,8 +1308,6 @@ def _cleanup_generate_workflow_resources(
     steps: list[Callable[[], None]] = []
     if persistence_sink is not None:
         steps.append(persistence_sink.close)
-    if checkpoint_connection is not None:
-        steps.append(checkpoint_connection.close)
     if staged_stdin_path is not None:
         steps.append(lambda: staged_stdin_path.unlink(missing_ok=True))
     for step in steps:
@@ -1179,7 +1352,6 @@ def run_generate_workflow(
     output_path = Path(output_jsonl) if output_jsonl else None
     checkpoint_path = _checkpoint_path_for(output_jsonl) if output_jsonl else None
 
-    checkpoint_connection: sqlite3.Connection | None = None
     persistence_sink: _FileBackedPersistenceSink | None = None
 
     try:
@@ -1201,7 +1373,7 @@ def run_generate_workflow(
 
         if resume and output_path is not None:
             assert checkpoint_path is not None
-            checkpoint_connection = _open_resume_checkpoint(
+            _validate_resume_checkpoint(
                 output_path,
                 checkpoint_path,
                 mapping_fingerprint=mapping_fingerprint,
@@ -1222,7 +1394,7 @@ def run_generate_workflow(
             prompt=prompt,
             effective_input_jsonl=effective_input_jsonl,
             resume=resume,
-            checkpoint_connection=checkpoint_connection,
+            checkpoint_path=checkpoint_path,
             persistence_sink=persistence_sink,
             mapper=mapper,
             window_size=window_size,
@@ -1234,6 +1406,5 @@ def run_generate_workflow(
     finally:
         _cleanup_generate_workflow_resources(
             persistence_sink=persistence_sink,
-            checkpoint_connection=checkpoint_connection,
             staged_stdin_path=staged_stdin_path,
         )

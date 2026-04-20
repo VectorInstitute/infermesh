@@ -97,14 +97,38 @@ def test_generate_rejects_malformed_rows(
     assert "Generation rows require" in rows[0]["error"]
 
 
-def test_generate_propagates_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_surfaces_provider_failure_as_error_row(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     class FailingClient(FakeCLIClient):
-        def generate_batch(self, input_batch: Any, **kwargs: Any) -> Any:
+        async def agenerate(self, input_data: Any, **kwargs: Any) -> Any:
             raise RuntimeError("boom")
 
     monkeypatch.setattr(cli, "_build_client", lambda *a, **k: FailingClient())
-    with pytest.raises(RuntimeError, match="boom"):
-        cli.main([*_BASE_ARGS, "--prompt", "hello"])
+    exit_code = cli.main([*_BASE_ARGS, "--prompt", "hello"])
+
+    assert exit_code == 0
+    row = json.loads(capsys.readouterr().out.strip())
+    assert row["error"] == "boom"
+    assert row["_index"] == 0
+
+
+def test_generate_surfaces_workflow_failure_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "_build_client", lambda *a, **k: FakeCLIClient())
+
+    def blow_up(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(cli, "run_generate_workflow", blow_up)
+
+    exit_code = cli.main([*_BASE_ARGS, "--prompt", "hello"])
+
+    assert exit_code == 1
+    assert "error: disk full" in capsys.readouterr().err
 
 
 @pytest.mark.usefixtures("fake_client_builder")
@@ -127,10 +151,13 @@ def test_generate_index_field_always_present(
         ]
     )
     assert exit_code == 0
-    rows = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = sorted(
+        (
+            json.loads(line)
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+        ),
+        key=lambda row: row["_index"],
+    )
     assert rows[0]["_index"] == 0
     assert rows[1]["_index"] == 1
 

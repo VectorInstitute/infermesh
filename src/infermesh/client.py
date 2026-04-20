@@ -384,7 +384,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> result.output_text
         """
 
-        return self._sync_runner.run(
+        return self._run_sync(
             self.agenerate(
                 input_data,
                 endpoint=endpoint,
@@ -454,7 +454,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> [item.output_text if item else None for item in batch.results]
         """
 
-        return self._sync_runner.run(
+        return self._run_sync(
             self.agenerate_batch(
                 input_batch,
                 endpoint=endpoint,
@@ -604,7 +604,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> len(result.embedding)
         """
 
-        return self._sync_runner.run(self.aembed(input_data, **kwargs))
+        return self._run_sync(self.aembed(input_data, **kwargs))
 
     def embed_batch(
         self,
@@ -657,7 +657,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> [len(item.embedding) if item else None for item in batch.results]
         """
 
-        return self._sync_runner.run(
+        return self._run_sync(
             self.aembed_batch(
                 input_batch,
                 micro_batch_size=micro_batch_size,
@@ -804,7 +804,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> result.text
         """
 
-        return self._sync_runner.run(
+        return self._run_sync(
             self.atranscribe(
                 input_data,
                 max_transcription_bytes=max_transcription_bytes,
@@ -866,7 +866,7 @@ class LMClient(_ClientRuntimeMixin):
         >>> [item.text if item else None for item in batch.results]
         """
 
-        return self._sync_runner.run(
+        return self._run_sync(
             self.atranscribe_batch(
                 input_batch,
                 max_transcription_bytes=max_transcription_bytes,
