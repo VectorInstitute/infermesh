@@ -227,7 +227,11 @@ before resuming is not supported. Results are written to disk one row at a
 time as each request completes, so a crash only loses the requests that were
 in-flight at that moment.
 
-Output rows within a window are written in completion order, not input order.
+The workflow keeps a rolling in-flight window, so each settled row immediately
+admits the next pending row until the source is exhausted. Output rows are
+written in completion order, not input order.
+Row-level generation failures become per-item `error` rows and do not abort
+their siblings, but setup and workflow failures still stop the command.
 Use the `_index` field to re-sort after the run if needed.
 
 `--resume` requires `--output-jsonl` and the matching `results.checkpoint.sqlite`

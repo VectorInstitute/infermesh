@@ -181,6 +181,10 @@ infermesh generate \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
+# Generate uses a rolling in-flight window by default (128 rows unless you
+# override it with --max-parallel-requests): each settled row immediately
+# admits the next pending row.
+
 # Resume an interrupted run — reads results.checkpoint.sqlite, skips settled rows, appends the rest
 infermesh generate \
   --model openai/gpt-4.1-mini \
