@@ -347,26 +347,36 @@ def _handle_generate(args: argparse.Namespace) -> int:
     # Use an open-ended progress bar for file-backed runs (total unknown up
     # front).  For a single --prompt to stdout, suppress it entirely.
     disable_bar = args.output_jsonl is None and args.prompt is not None
-    with tqdm(
-        desc="Generating", unit="req", disable=disable_bar, file=sys.stderr
-    ) as bar:
-        try:
-            with _managed_client(config) as client:
-                run_generate_workflow(
-                    client,
-                    prompt=args.prompt,
-                    input_jsonl=args.input_jsonl,
-                    output_jsonl=args.output_jsonl,
-                    mapper_spec=getattr(args, "mapper", None),
-                    resume=resume,
-                    endpoint=config.endpoint,
-                    window_size=window_size,
-                    parse_json=bool(getattr(args, "parse_json", False)),
-                    on_progress=lambda: bar.update(),  # noqa: PLW0108
-                )
-        except (ImportError, ValueError) as exc:
-            sys.stderr.write(f"error: {exc}\n")
-            return 1
+    try:
+        with (
+            _managed_client(config) as client,
+            tqdm(
+                desc="Generating", unit="req", disable=disable_bar, file=sys.stderr
+            ) as bar,
+        ):
+
+            def report_status(message: str) -> None:
+                if disable_bar:
+                    sys.stderr.write(message + "\n")
+                else:
+                    bar.write(message)
+
+            run_generate_workflow(
+                client,
+                prompt=args.prompt,
+                input_jsonl=args.input_jsonl,
+                output_jsonl=args.output_jsonl,
+                mapper_spec=getattr(args, "mapper", None),
+                resume=resume,
+                endpoint=config.endpoint,
+                window_size=window_size,
+                parse_json=bool(getattr(args, "parse_json", False)),
+                on_progress=lambda: bar.update(),  # noqa: PLW0108
+                on_status=report_status,
+            )
+    except (ImportError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
     return 0
 
 

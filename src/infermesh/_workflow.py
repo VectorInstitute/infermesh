@@ -75,6 +75,7 @@ class _PersistenceShutdown:
 _SCHEMA_VERSION = 1
 _RUN_METADATA_SINGLETON = 1
 _ITEM_INSERT_BATCH_SIZE = 1000
+_STATUS_LOG_INTERVAL = 100_000
 
 _PENDING_STATUS = 0
 _SUCCESS_STATUS = 1
@@ -654,12 +655,14 @@ def _validate_resume_mapping_fingerprint(
         )
 
 
-def _load_output_indices(output_path: Path) -> set[int]:
-    """Return the set of integer ``_index`` values present in the output file."""
+def _load_output_indices_with_status(
+    output_path: Path, on_status: Callable[[str], Any] | None
+) -> set[int]:
+    """Return output indices while emitting coarse resume-scan status lines."""
 
     observed_indices: set[int] = set()
     with output_path.open(encoding="utf-8") as file_handle:
-        for line in file_handle:
+        for line_number, line in enumerate(file_handle, start=1):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -672,15 +675,38 @@ def _load_output_indices(output_path: Path) -> set[int]:
             output_index = row.get("_index")
             if isinstance(output_index, int):
                 observed_indices.add(output_index)
+            if on_status is not None and line_number % _STATUS_LOG_INTERVAL == 0:
+                on_status(f"Resume: scanned {line_number:,} output rows...")
     return observed_indices
 
 
+def _load_checkpoint_fingerprint_counts(
+    connection: sqlite3.Connection,
+) -> dict[bytes, int]:
+    """Return remaining per-fingerprint source occurrences from the checkpoint."""
+
+    return {
+        cast(bytes, row[0]): int(row[1])
+        for row in connection.execute(
+            """
+            SELECT record_fingerprint, COUNT(*)
+            FROM items
+            GROUP BY record_fingerprint
+            """
+        )
+    }
+
+
 def _validate_resume_output_rows(
-    connection: sqlite3.Connection, output_path: Path
+    connection: sqlite3.Connection,
+    output_path: Path,
+    on_status: Callable[[str], Any] | None = None,
 ) -> None:
     """Ensure every settled checkpoint item already exists in the output file."""
 
-    output_indices = _load_output_indices(output_path)
+    if on_status is not None:
+        on_status("Resume: validating output artifact...")
+    output_indices = _load_output_indices_with_status(output_path, on_status)
     missing_indices: list[int] = []
 
     for row in connection.execute(
@@ -714,21 +740,32 @@ def _validate_resume_source(
     *,
     prompt: str | None,
     input_jsonl: str | None,
+    on_status: Callable[[str], Any] | None = None,
 ) -> None:
     """Validate that the current source matches the checkpoint occurrence set."""
 
-    seen_count = 0
-    for _, checkpoint_key in _iter_source_rows_with_keys(
-        prompt=prompt, input_jsonl=input_jsonl
-    ):
-        if _load_checkpoint_item(connection, checkpoint_key) is None:
-            raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
-        seen_count += 1
+    if on_status is not None:
+        on_status("Resume: validating input source...")
 
-    # The per-key lookup above catches added rows; the count comparison catches
-    # removed rows (source has fewer occurrences than the checkpoint recorded).
-    expected_count = int(connection.execute("SELECT COUNT(*) FROM items").fetchone()[0])
-    if seen_count != expected_count:
+    remaining_counts = _load_checkpoint_fingerprint_counts(connection)
+    for seen_count, source_row in enumerate(
+        _iter_source_rows(prompt=prompt, input_jsonl=input_jsonl), start=1
+    ):
+        if source_row.raw_record is not None:
+            fingerprint = _compute_record_fingerprint(source_row.raw_record)
+        else:
+            fingerprint = _compute_parse_error_fingerprint(source_row.raw_line)
+        remaining = remaining_counts.get(fingerprint)
+        if remaining is None:
+            raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
+        if remaining == 1:
+            del remaining_counts[fingerprint]
+        else:
+            remaining_counts[fingerprint] = remaining - 1
+        if on_status is not None and seen_count % _STATUS_LOG_INTERVAL == 0:
+            on_status(f"Resume: scanned {seen_count:,} source rows...")
+
+    if remaining_counts:
         raise ValueError(_RESUME_SOURCE_MISMATCH_ERROR)
 
 
@@ -739,6 +776,7 @@ def _open_resume_checkpoint(
     mapping_fingerprint: str,
     prompt: str | None,
     input_jsonl: str | None,
+    on_status: Callable[[str], Any] | None = None,
 ) -> sqlite3.Connection:
     """Open and validate the resume checkpoint for a file-backed workflow."""
 
@@ -755,15 +793,18 @@ def _open_resume_checkpoint(
 
     connection = _connect_checkpoint_db(checkpoint_path)
     try:
+        if on_status is not None:
+            on_status("Resume: validating checkpoint file...")
         _validate_resume_mapping_fingerprint(
             connection,
             mapping_fingerprint=mapping_fingerprint,
         )
-        _validate_resume_output_rows(connection, output_path)
+        _validate_resume_output_rows(connection, output_path, on_status=on_status)
         _validate_resume_source(
             connection,
             prompt=prompt,
             input_jsonl=input_jsonl,
+            on_status=on_status,
         )
     except BaseException:
         connection.close()
@@ -1118,6 +1159,7 @@ def run_generate_workflow(
     window_size: int,
     parse_json: bool,
     on_progress: Callable[[], Any] | None = None,
+    on_status: Callable[[str], Any] | None = None,
 ) -> None:
     """Run the generate workflow engine."""
 
@@ -1147,6 +1189,8 @@ def run_generate_workflow(
 
         if output_path is not None and not resume:
             assert checkpoint_path is not None
+            if on_status is not None:
+                on_status("Preparing fresh workflow artifacts...")
             _stage_fresh_workflow_files(
                 prompt=prompt,
                 input_jsonl=effective_input_jsonl,
@@ -1163,9 +1207,12 @@ def run_generate_workflow(
                 mapping_fingerprint=mapping_fingerprint,
                 prompt=prompt,
                 input_jsonl=effective_input_jsonl,
+                on_status=on_status,
             )
         if output_path is not None:
             assert checkpoint_path is not None
+            if on_status is not None:
+                on_status("Opening output and checkpoint files...")
             persistence_sink = _FileBackedPersistenceSink(
                 output_path=output_path, checkpoint_path=checkpoint_path
             )
