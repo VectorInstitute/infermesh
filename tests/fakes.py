@@ -7,7 +7,16 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
-from infermesh._workflow import _compute_record_fingerprint
+from infermesh._workflow import (
+    _STATUS_NAMES,
+    _STATUS_VALUES,
+    _checkpoint_path_for,
+    _compute_mapping_fingerprint,
+    _compute_parse_error_fingerprint,
+    _compute_record_fingerprint,
+    _connect_checkpoint_db,
+    _initialize_checkpoint_db,
+)
 from infermesh.client import LMClient
 from infermesh.types import (
     BatchResult,
@@ -267,26 +276,117 @@ class FakeCLIClient:
         )
 
 
-def state_row_for_record(
+def load_resume_state(
+    checkpoint_path: Path,
+) -> dict[tuple[bytes, int], dict[str, Any]]:
+    """Load checkpoint items for test assertions."""
+
+    if not checkpoint_path.exists():
+        return {}
+
+    connection = _connect_checkpoint_db(checkpoint_path)
+    try:
+        state: dict[tuple[bytes, int], dict[str, Any]] = {}
+        for row in connection.execute(
+            """
+            SELECT record_fingerprint, occurrence, output_index, status, error
+            FROM items
+            """
+        ):
+            status = int(row[3])
+            state[(bytes(row[0]), int(row[1]))] = {
+                "_index": int(row[2]),
+                "status": _STATUS_NAMES[status],
+                "error": row[4],
+            }
+        return state
+    finally:
+        connection.close()
+
+
+def checkpoint_item_for_record(
     record: dict[str, Any],
     *,
     occurrence: int,
     index: int,
     status: str,
     error: str | None = None,
-    mapping_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    """Build a checkpoint state row for a well-formed source record."""
-    row: dict[str, Any] = {
+    """Build a checkpoint item payload for a well-formed source record."""
+
+    return {
         "record_fingerprint": _compute_record_fingerprint(record),
         "occurrence": occurrence,
         "_index": index,
         "status": status,
         "error": error,
     }
-    if mapping_fingerprint is not None:
-        row["mapping_fingerprint"] = mapping_fingerprint
-    return row
+
+
+def checkpoint_item_for_parse_error(
+    raw_line: str,
+    *,
+    occurrence: int,
+    index: int,
+    status: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build a checkpoint item payload for a malformed source line."""
+
+    return {
+        "record_fingerprint": _compute_parse_error_fingerprint(raw_line),
+        "occurrence": occurrence,
+        "_index": index,
+        "status": status,
+        "error": error,
+    }
+
+
+def write_checkpoint_db(
+    output_path: Path,
+    items: list[dict[str, Any]],
+    *,
+    mapping_fingerprint: str | None = None,
+) -> Path:
+    """Create a checkpoint DB for tests and populate it with explicit items."""
+
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    connection = _connect_checkpoint_db(checkpoint_path)
+    try:
+        resolved_mapping_fingerprint = (
+            mapping_fingerprint
+            or _compute_mapping_fingerprint(
+                mapper_spec=None,
+                mapper=None,
+            )
+        )
+        _initialize_checkpoint_db(connection, resolved_mapping_fingerprint)
+        connection.executemany(
+            """
+            INSERT INTO items (
+                record_fingerprint,
+                occurrence,
+                output_index,
+                status,
+                error
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["record_fingerprint"],
+                    item["occurrence"],
+                    item["_index"],
+                    _STATUS_VALUES[item["status"]],
+                    item["error"],
+                )
+                for item in items
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return checkpoint_path
 
 
 @pytest.fixture

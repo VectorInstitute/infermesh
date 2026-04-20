@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
 import types
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,13 +15,18 @@ from typing import Any
 import pytest
 
 from infermesh._workflow import (
-    _compute_parse_error_fingerprint,
-    _compute_record_fingerprint,
-    _load_resume_state,
-    _state_path_for,
+    _checkpoint_path_for,
+    _compute_mapping_fingerprint,
+    _connect_checkpoint_db,
+    _load_run_metadata,
     run_generate_workflow,
 )
-from tests.fakes import state_row_for_record
+from tests.fakes import (
+    checkpoint_item_for_parse_error,
+    checkpoint_item_for_record,
+    load_resume_state,
+    write_checkpoint_db,
+)
 
 # ---------------------------------------------------------------------------
 # Fake client
@@ -50,6 +56,29 @@ class _FakeClient:
 
     def close(self) -> None:
         pass
+
+
+class _ThreadedCallbackFakeClient(_FakeClient):
+    """Fake client that fires callbacks from a non-caller thread."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.callback_thread_ids: list[int] = []
+
+    def generate_batch(self, input_batch: list[Any], **kwargs: Any) -> None:
+        self.batches.append(list(input_batch))
+        on_result = kwargs.get("on_result")
+        if on_result is None:
+            return
+
+        def worker() -> None:
+            self.callback_thread_ids.append(threading.get_ident())
+            for idx, item in enumerate(input_batch):
+                on_result(idx, _FakeResult(output_text=f"out:{item}"), None)
+
+        thread = threading.Thread(target=worker, name="test-workflow-callback")
+        thread.start()
+        thread.join()
 
 
 # ---------------------------------------------------------------------------
@@ -95,25 +124,13 @@ def _run(
     )
 
 
-def _state_row_for_parse_error(
-    raw_line: str,
-    *,
-    occurrence: int,
-    index: int,
-    status: str,
-    error: str | None = None,
-    mapping_fingerprint: str | None = None,
-) -> dict[str, Any]:
-    row = {
-        "record_fingerprint": _compute_parse_error_fingerprint(raw_line),
-        "occurrence": occurrence,
-        "_index": index,
-        "status": status,
-        "error": error,
-    }
-    if mapping_fingerprint is not None:
-        row["mapping_fingerprint"] = mapping_fingerprint
-    return row
+def _load_mapping_fingerprint(checkpoint_path: Path) -> str:
+    connection = _connect_checkpoint_db(checkpoint_path)
+    try:
+        _, mapping_fingerprint = _load_run_metadata(connection)
+        return mapping_fingerprint
+    finally:
+        connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +153,66 @@ def test_file_backed_generate_streams_input(tmp_path: Path) -> None:
 
     out_rows = _read_output(output_path)
     assert len(out_rows) == 7
+
+
+def test_file_backed_generate_persists_threaded_callbacks(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    client = _ThreadedCallbackFakeClient()
+
+    _run(client, input_path=input_path, output_path=output_path)
+
+    assert client.batches == [["a", "b"]]
+    assert len(client.callback_thread_ids) == 1
+    assert client.callback_thread_ids[0] != threading.get_ident()
+
+    out_rows = _read_output(output_path)
+    assert [row["output_text"] for row in out_rows] == ["out:a", "out:b"]
+
+    state = load_resume_state(checkpoint_path)
+    assert len(state) == 2
+    assert {row["status"] for row in state.values()} == {"success"}
+
+
+def test_resume_skips_settled_rows_with_threaded_callbacks(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0], occurrence=0, index=0, status="success"
+            ),
+            checkpoint_item_for_record(
+                rows[1], occurrence=0, index=1, status="pending"
+            ),
+            checkpoint_item_for_record(
+                rows[2], occurrence=0, index=2, status="pending"
+            ),
+        ],
+    )
+
+    client = _ThreadedCallbackFakeClient()
+    _run(client, input_path=input_path, output_path=output_path, resume=True)
+
+    all_inputs = [item for batch in client.batches for item in batch]
+    assert all_inputs == ["b", "c"]
+
+    rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
+    assert rows_by_index[1]["output_text"] == "out:b"
+    assert rows_by_index[2]["output_text"] == "out:c"
+
+    state = load_resume_state(checkpoint_path)
+    assert {row["status"] for row in state.values()} == {"success"}
 
 
 def test_builtin_row_conventions(tmp_path: Path) -> None:
@@ -293,34 +370,35 @@ def test_fresh_run_bootstrap_failure_preserves_existing_artifacts(
 ) -> None:
     input_path = tmp_path / "missing.jsonl"
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
+    checkpoint_path = _checkpoint_path_for(str(output_path))
     old_output = json.dumps({"_index": 99, "output_text": "keep-me"}) + "\n"
-    old_state = (
-        json.dumps(
-            state_row_for_record(
+    output_path.write_text(old_output, encoding="utf-8")
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
                 {"prompt": "old"},
                 occurrence=0,
                 index=99,
                 status="success",
             )
-        )
-        + "\n"
+        ],
     )
-    output_path.write_text(old_output, encoding="utf-8")
-    state_path.write_text(old_state, encoding="utf-8")
+    old_checkpoint = checkpoint_path.read_bytes()
     client = _FakeClient()
 
     with pytest.raises(FileNotFoundError):
         _run(client, input_path=input_path, output_path=output_path)
 
     assert output_path.read_text(encoding="utf-8") == old_output
-    assert state_path.read_text(encoding="utf-8") == old_state
+    assert checkpoint_path.read_bytes() == old_checkpoint
     assert client.batches == []
-def test_resume_skips_items_from_state_file(tmp_path: Path) -> None:
+
+
+def test_resume_skips_items_from_checkpoint_file(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         "\n".join(
             json.dumps(
@@ -331,25 +409,22 @@ def test_resume_skips_items_from_state_file(tmp_path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-
-    # Pre-populate state file for rows 0 (a) and 2 (c)
-    with state_path.open("w", encoding="utf-8") as fh:
-        for source_index, row, status in [
-            (0, rows[0], "success"),
-            (1, rows[1], "pending"),
-            (2, rows[2], "success"),
-        ]:
-            fh.write(
-                json.dumps(
-                    state_row_for_record(
-                        row,
-                        occurrence=0,
-                        index=source_index,
-                        status=status,
-                    )
-                )
-                + "\n"
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                row,
+                occurrence=0,
+                index=source_index,
+                status=status,
             )
+            for source_index, row, status in [
+                (0, rows[0], "success"),
+                (1, rows[1], "pending"),
+                (2, rows[2], "success"),
+            ]
+        ],
+    )
 
     client = _FakeClient()
     _run(client, input_path=input_path, output_path=output_path, resume=True)
@@ -376,13 +451,9 @@ def test_resume_rejects_missing_output_file(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
-    state_path.write_text(
-        json.dumps(
-            state_row_for_record(rows[0], occurrence=0, index=0, status="success")
-        )
-        + "\n",
-        encoding="utf-8",
+    write_checkpoint_db(
+        output_path,
+        [checkpoint_item_for_record(rows[0], occurrence=0, index=0, status="success")],
     )
     client = _FakeClient()
 
@@ -394,25 +465,21 @@ def test_resume_rejects_truncated_output_file(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}, {"prompt": "b"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
         encoding="utf-8",
     )
-    state_path.write_text(
-        "\n".join(
-            json.dumps(
-                state_row_for_record(
-                    row,
-                    occurrence=0,
-                    index=index,
-                    status="success",
-                )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                row,
+                occurrence=0,
+                index=index,
+                status="success",
             )
             for index, row in enumerate(rows)
-        )
-        + "\n",
-        encoding="utf-8",
+        ],
     )
     client = _FakeClient()
 
@@ -420,81 +487,54 @@ def test_resume_rejects_truncated_output_file(tmp_path: Path) -> None:
         _run(client, input_path=input_path, output_path=output_path, resume=True)
 
 
-def test_resume_keeps_latest_state_per_occurrence(tmp_path: Path) -> None:
-    record = {"prompt": "hello"}
-    checkpoint_key = (_compute_record_fingerprint(record), 0)
-    state_path = tmp_path / "out.state.jsonl"
+def test_completed_run_updates_checkpoint_rows_in_place(tmp_path: Path) -> None:
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    client = _FakeClient()
 
-    with state_path.open("w", encoding="utf-8") as fh:
-        # First entry: error; second entry: success (last-write-wins)
-        fh.write(
-            json.dumps(
-                state_row_for_record(
-                    record,
-                    occurrence=0,
-                    index=0,
-                    status="error",
-                    error="oops",
-                )
-            )
-            + "\n"
-        )
-        fh.write(
-            json.dumps(
-                state_row_for_record(
-                    record,
-                    occurrence=0,
-                    index=0,
-                    status="success",
-                )
-            )
-            + "\n"
-        )
+    _run(client, input_path=input_path, output_path=output_path)
 
-    state = _load_resume_state(state_path)
-    assert state[checkpoint_key]["status"] == "success"
+    state = load_resume_state(checkpoint_path)
+    assert len(state) == 3
+    assert {row["status"] for row in state.values()} == {"success"}
+    assert _load_mapping_fingerprint(checkpoint_path) == _compute_mapping_fingerprint(
+        mapper_spec=None,
+        mapper=None,
+    )
 
 
 def test_resume_tracks_duplicate_records_independently(tmp_path: Path) -> None:
     rows = [{"prompt": "dup"}, {"prompt": "dup"}, {"prompt": "tail"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": "cached-dup"}) + "\n",
         encoding="utf-8",
     )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    state_row_for_record(
-                        rows[0],
-                        occurrence=0,
-                        index=0,
-                        status="success",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        rows[1],
-                        occurrence=1,
-                        index=1,
-                        status="pending",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        rows[2],
-                        occurrence=0,
-                        index=2,
-                        status="pending",
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0],
+                occurrence=0,
+                index=0,
+                status="success",
+            ),
+            checkpoint_item_for_record(
+                rows[1],
+                occurrence=1,
+                index=1,
+                status="pending",
+            ),
+            checkpoint_item_for_record(
+                rows[2],
+                occurrence=0,
+                index=2,
+                status="pending",
+            ),
+        ],
     )
 
     client = _FakeClient()
@@ -505,104 +545,6 @@ def test_resume_tracks_duplicate_records_independently(tmp_path: Path) -> None:
     rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
     assert rows_by_index[1]["output_text"] == "out:dup"
     assert rows_by_index[2]["output_text"] == "out:tail"
-
-
-def test_resume_legacy_manifest_without_mapping_fingerprint_still_works(
-    tmp_path: Path,
-) -> None:
-    rows = [{"prompt": "a"}, {"prompt": "b"}]
-    input_path = _write_input(tmp_path, rows)
-    output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
-    output_path.write_text(
-        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
-        encoding="utf-8",
-    )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    state_row_for_record(
-                        rows[0],
-                        occurrence=0,
-                        index=0,
-                        status="success",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        rows[1],
-                        occurrence=0,
-                        index=1,
-                        status="pending",
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    client = _FakeClient()
-    _run(client, input_path=input_path, output_path=output_path, resume=True)
-
-    assert client.batches == [["b"]]
-
-
-def test_resume_rejects_legacy_manifest_with_custom_mapper(tmp_path: Path) -> None:
-    rows = [{"prompt": "first"}, {"prompt": "second"}]
-    input_path = _write_input(tmp_path, rows)
-    output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
-    output_path.write_text(
-        json.dumps({"_index": 0, "output_text": "cached-first"}) + "\n",
-        encoding="utf-8",
-    )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    state_row_for_record(
-                        rows[0],
-                        occurrence=0,
-                        index=0,
-                        status="success",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        rows[1],
-                        occurrence=0,
-                        index=1,
-                        status="pending",
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    fake_mod = types.ModuleType("_test_wf_legacy_mapper_mod")
-
-    def my_mapper(record: dict[str, Any]) -> dict[str, Any]:
-        return {"input": record["prompt"].upper()}
-
-    my_mapper.__module__ = "_test_wf_legacy_mapper_mod"
-    fake_mod.my_mapper = my_mapper  # type: ignore[attr-defined]
-    sys.modules["_test_wf_legacy_mapper_mod"] = fake_mod
-    try:
-        client = _FakeClient()
-        with pytest.raises(ValueError, match="predates mapper fingerprints"):
-            _run(
-                client,
-                input_path=input_path,
-                output_path=output_path,
-                mapper_spec="_test_wf_legacy_mapper_mod:my_mapper",
-                resume=True,
-            )
-    finally:
-        del sys.modules["_test_wf_legacy_mapper_mod"]
 
 
 def test_resume_rejects_changed_mapper_implementation(tmp_path: Path) -> None:
@@ -641,13 +583,8 @@ def test_resume_rejects_changed_mapper_implementation(tmp_path: Path) -> None:
             mapper_spec=f"{module_name}:my_mapper",
         )
 
-        state_path = _state_path_for(str(output_path))
-        state_rows = [
-            json.loads(line)
-            for line in state_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert all("mapping_fingerprint" in row for row in state_rows)
+        checkpoint_path = _checkpoint_path_for(str(output_path))
+        assert _load_mapping_fingerprint(checkpoint_path)
 
         write_mapper_module("v2")
         sys.modules.pop(module_name, None)
@@ -697,9 +634,9 @@ def test_resume_allows_empty_custom_mapper_checkpoint(tmp_path: Path) -> None:
             resume=True,
         )
 
-        state_path = _state_path_for(str(output_path))
+        checkpoint_path = _checkpoint_path_for(str(output_path))
         assert output_path.read_text(encoding="utf-8") == ""
-        assert state_path.read_text(encoding="utf-8") == ""
+        assert load_resume_state(checkpoint_path) == {}
         assert resume_client.batches == []
     finally:
         del sys.modules["_test_wf_empty_mapper_mod"]
@@ -710,42 +647,32 @@ def test_resume_preserves_original_indexes_after_reorder(tmp_path: Path) -> None
     reordered_rows = [original_rows[2], original_rows[0], original_rows[1]]
     input_path = _write_input(tmp_path, reordered_rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
         encoding="utf-8",
     )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    state_row_for_record(
-                        original_rows[0],
-                        occurrence=0,
-                        index=0,
-                        status="success",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        original_rows[1],
-                        occurrence=0,
-                        index=1,
-                        status="pending",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        original_rows[2],
-                        occurrence=0,
-                        index=2,
-                        status="pending",
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                original_rows[0],
+                occurrence=0,
+                index=0,
+                status="success",
+            ),
+            checkpoint_item_for_record(
+                original_rows[1],
+                occurrence=0,
+                index=1,
+                status="pending",
+            ),
+            checkpoint_item_for_record(
+                original_rows[2],
+                occurrence=0,
+                index=2,
+                status="pending",
+            ),
+        ],
     )
 
     client = _FakeClient()
@@ -772,26 +699,22 @@ def test_resume_rejects_mismatched_occurrences(
 ) -> None:
     input_path = _write_input(tmp_path, input_rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text("", encoding="utf-8")
-    state_path.write_text(
-        "\n".join(
-            json.dumps(
-                state_row_for_record(
-                    row,
-                    occurrence=occurrence,
-                    index=occurrence,
-                    status="pending",
-                )
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                row,
+                occurrence=occurrence,
+                index=occurrence,
+                status="pending",
             )
             for occurrence, row in enumerate(checkpoint_rows)
-        )
-        + "\n",
-        encoding="utf-8",
+        ],
     )
 
     client = _FakeClient()
-    with pytest.raises(ValueError, match="does not match the checkpoint manifest"):
+    with pytest.raises(ValueError, match="does not match the checkpoint file"):
         _run(client, input_path=input_path, output_path=output_path, resume=True)
 
 
@@ -801,28 +724,26 @@ def test_resume_ignores_pending_rows_when_validating_output_rows(
     rows = [{"prompt": "a"}, {"prompt": "b"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
         encoding="utf-8",
     )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    state_row_for_record(
-                        rows[0], occurrence=0, index=0, status="success"
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        rows[1], occurrence=0, index=1, status="pending"
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_record(
+                rows[0],
+                occurrence=0,
+                index=0,
+                status="success",
+            ),
+            checkpoint_item_for_record(
+                rows[1],
+                occurrence=0,
+                index=1,
+                status="pending",
+            ),
+        ],
     )
 
     client = _FakeClient()
@@ -840,44 +761,34 @@ def test_resume_tracks_duplicate_parse_errors_by_occurrence(tmp_path: Path) -> N
         encoding="utf-8",
     )
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": None, "error": "cached-parse-error"})
         + "\n",
         encoding="utf-8",
     )
-    state_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    _state_row_for_parse_error(
-                        bad_line,
-                        occurrence=0,
-                        index=0,
-                        status="error",
-                        error="cached-parse-error",
-                    )
-                ),
-                json.dumps(
-                    state_row_for_record(
-                        {"prompt": "good"},
-                        occurrence=0,
-                        index=1,
-                        status="pending",
-                    )
-                ),
-                json.dumps(
-                    _state_row_for_parse_error(
-                        bad_line,
-                        occurrence=1,
-                        index=2,
-                        status="pending",
-                    )
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_checkpoint_db(
+        output_path,
+        [
+            checkpoint_item_for_parse_error(
+                bad_line,
+                occurrence=0,
+                index=0,
+                status="error",
+                error="cached-parse-error",
+            ),
+            checkpoint_item_for_record(
+                {"prompt": "good"},
+                occurrence=0,
+                index=1,
+                status="pending",
+            ),
+            checkpoint_item_for_parse_error(
+                bad_line,
+                occurrence=1,
+                index=2,
+                status="pending",
+            ),
+        ],
     )
 
     client = _FakeClient()
@@ -890,7 +801,7 @@ def test_resume_tracks_duplicate_parse_errors_by_occurrence(tmp_path: Path) -> N
     assert rows_by_index[2]["error"] is not None
 
 
-def test_stdout_path_creates_no_state_file(
+def test_stdout_path_creates_no_checkpoint_file(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -900,7 +811,7 @@ def test_stdout_path_creates_no_state_file(
 
     _run(client, input_path=input_path, output_path=None)
 
-    assert list(tmp_path.glob("*.state.jsonl")) == []
+    assert list(tmp_path.glob("*.checkpoint.sqlite")) == []
 
     out = capsys.readouterr().out
     out_rows = [json.loads(line) for line in out.splitlines() if line.strip()]
@@ -948,6 +859,8 @@ def test_invalid_metadata_becomes_error_row_without_aborting_siblings(
         assert rows_by_index[1]["error"] is None
     finally:
         del sys.modules["_test_wf_metadata_mod"]
+
+
 def test_file_backed_generate_materialises_stdin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -966,3 +879,30 @@ def test_file_backed_generate_materialises_stdin(
     assert out_rows[0]["error"] is None
     # No stray temp artefacts should remain in the working directory
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_persistence_sink_failure_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infermesh._workflow as wf_module
+
+    original = wf_module._mark_checkpoint_item_settled
+    call_count = 0
+
+    def failing_mark(connection, checkpoint_key, *, status, error):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("injected sink failure")
+        original(connection, checkpoint_key, status=status, error=error)
+
+    monkeypatch.setattr(wf_module, "_mark_checkpoint_item_settled", failing_mark)
+
+    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+    input_path = _write_input(tmp_path, rows)
+    output_path = tmp_path / "out.jsonl"
+    client = _FakeClient()
+
+    with pytest.raises(RuntimeError, match="injected sink failure"):
+        _run(client, input_path=input_path, output_path=output_path)

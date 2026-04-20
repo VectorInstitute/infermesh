@@ -129,8 +129,8 @@ def _add_generate_parser(subparsers: Any) -> None:
         "--resume",
         action="store_true",
         help=(
-            "Resume a previous run by reading the checkpoint manifest "
-            "*.state.jsonl and appending the unsettled rows."
+            "Resume a previous run by reading the checkpoint file "
+            "*.checkpoint.sqlite and appending the unsettled rows."
         ),
     )
     generate_parser.add_argument(

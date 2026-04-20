@@ -9,8 +9,8 @@ import pytest
 
 from infermesh import cli
 from infermesh._cli_support import _client_config_from_args
-from infermesh._workflow import _state_path_for
-from tests.fakes import FakeCLIClient, state_row_for_record
+from infermesh._workflow import _checkpoint_path_for
+from tests.fakes import FakeCLIClient, checkpoint_item_for_record, write_checkpoint_db
 
 _BASE_ARGS = [
     "generate",
@@ -192,17 +192,16 @@ def test_generate_resume_nothing_to_do(
 ) -> None:
     input_path = tmp_path / "in.jsonl"
     output_path = tmp_path / "out.jsonl"
-    state_path = _state_path_for(str(output_path))
     row = {"prompt": "a"}
     input_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     output_path.write_text(
         json.dumps({"_index": 0, "output_text": "done"}) + "\n", encoding="utf-8"
     )
-    state_path.write_text(
-        json.dumps(state_row_for_record(row, occurrence=0, index=0, status="success"))
-        + "\n",
-        encoding="utf-8",
+    checkpoint_path = write_checkpoint_db(
+        output_path,
+        [checkpoint_item_for_record(row, occurrence=0, index=0, status="success")],
     )
+    assert checkpoint_path == _checkpoint_path_for(str(output_path))
     exit_code = cli.main(
         [
             *_BASE_ARGS,
