@@ -454,6 +454,13 @@ def test_resume_requires_same_checkpoint_dir_override(tmp_path: Path) -> None:
         _run(client, input_path=input_path, output_path=output_path, resume=True)
 
 
+def test_resume_requires_file_backed_run() -> None:
+    client = _FakeClient()
+
+    with pytest.raises(ValueError, match="--resume requires --output-jsonl"):
+        _run(client, prompt="hello", resume=True)
+
+
 def test_builtin_row_conventions(tmp_path: Path) -> None:
     rows: list[dict[str, Any]] = [
         {"prompt": "hello"},

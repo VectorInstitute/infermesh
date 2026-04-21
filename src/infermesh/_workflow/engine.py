@@ -246,6 +246,12 @@ def run_generate_workflow(
 ) -> None:
     """Run the generate workflow engine."""
 
+    if resume and output_jsonl is None:
+        raise ValueError(
+            "--resume requires --output-jsonl because resumed runs need a "
+            "checkpoint file."
+        )
+
     run = _prepare_generate_run_resources(
         prompt=prompt,
         input_jsonl=input_jsonl,
