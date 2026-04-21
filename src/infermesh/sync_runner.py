@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
 from collections.abc import Coroutine
 from concurrent.futures import Future
 from typing import TypeVar
@@ -96,18 +97,45 @@ class SyncRunner:
         >>> runner.run(add(1, 2))
         3
         """
-        future: Future[T] = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        future: Future[T] = Future()
+        task_future: Future[asyncio.Task[T]] = Future()
+
+        def start_task() -> None:
+            task = self._loop.create_task(coroutine)
+            task_future.set_result(task)
+
+            def copy_result(completed_task: asyncio.Task[T]) -> None:
+                try:
+                    future.set_result(completed_task.result())
+                except asyncio.CancelledError:
+                    future.cancel()
+                except BaseException as exc:  # noqa: BLE001
+                    future.set_exception(exc)
+
+            task.add_done_callback(copy_result)
+
+        self._loop.call_soon_threadsafe(start_task)
+        task = self._wait_for_future(task_future)
         try:
-            return future.result()
+            return self._wait_for_future(future)
         except KeyboardInterrupt:
             # If the caller is interrupted while blocked on the result, the
-            # coroutine is still alive on the background loop. Cancel it and
-            # wait briefly for its cleanup/finally blocks to run so workflow
-            # resources (e.g. SQLite handles) are not stranded mid-shutdown.
-            future.cancel()
-            with contextlib.suppress(Exception):
-                future.result(timeout=2.0)
+            # coroutine is still alive on the background loop. Cancel the
+            # loop-owned task and give its cleanup/finally blocks a brief
+            # chance to run before re-raising on the caller's thread.
+            self._loop.call_soon_threadsafe(task.cancel)
+            deadline = time.monotonic() + 2.0
+            while not future.done() and time.monotonic() < deadline:
+                with contextlib.suppress(Exception):
+                    self._wait_for_future(future, timeout=0.1)
+                    break
             raise
+
+    @staticmethod
+    def _wait_for_future(future: Future[T], timeout: float | None = None) -> T:
+        """Wait for a cross-thread future result."""
+
+        return future.result(timeout=timeout)
 
     def close(self) -> None:
         """Stop the background event loop and join the worker thread.
