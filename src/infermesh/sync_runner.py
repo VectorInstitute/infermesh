@@ -97,7 +97,17 @@ class SyncRunner:
         3
         """
         future: Future[T] = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
-        return future.result()
+        try:
+            return future.result()
+        except KeyboardInterrupt:
+            # If the caller is interrupted while blocked on the result, the
+            # coroutine is still alive on the background loop. Cancel it and
+            # wait briefly for its cleanup/finally blocks to run so workflow
+            # resources (e.g. SQLite handles) are not stranded mid-shutdown.
+            future.cancel()
+            with contextlib.suppress(Exception):
+                future.result(timeout=2.0)
+            raise
 
     def close(self) -> None:
         """Stop the background event loop and join the worker thread.
