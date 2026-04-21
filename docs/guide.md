@@ -92,7 +92,7 @@ with open("results.jsonl", "w") as out, \
 The callback receives:
 
 | Argument | Type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `index` | `int` | Position in `input_batch` (global item index, not micro-batch index) |
 | `result` | `GenerationResult \| EmbeddingResult \| TranscriptionResult \| None` | `None` on failure |
 | `error` | `BaseException \| None` | `None` on success |
@@ -192,9 +192,20 @@ Input rows for `infermesh generate` may contain any of the following fields:
 
 ### Resuming an Interrupted Run
 
-If a long batch is interrupted (Ctrl-C, OOM, network loss), the output file
-contains all rows completed so far. Re-run with `--resume` to skip them and
-append only the remaining rows:
+Every file-backed run writes a checkpoint file alongside the output:
+
+```
+results.jsonl             ← your output (human-readable)
+results.checkpoint.sqlite ← checkpoint file (resume state)
+```
+
+By default the checkpoint stays beside the output for portability and
+discoverability. If you want the checkpoint on local scratch instead, pass
+`--checkpoint-dir DIR` or set `INFERMESH_CHECKPOINT_DIR=DIR` before the run.
+When you resume later, reuse the same checkpoint-dir setting.
+
+If a long batch is interrupted (Ctrl-C, OOM, network loss), re-run with
+`--resume` to skip settled items and append only the remaining rows:
 
 ```bash
 # First attempt — interrupted partway through
@@ -204,7 +215,7 @@ infermesh generate \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
-# Resume — reads results.jsonl, skips completed _index values, appends the rest
+# Resume — reads results.checkpoint.sqlite, skips settled items, appends the rest
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
@@ -213,9 +224,64 @@ infermesh generate \
   --resume
 ```
 
-Results are written to disk one row at a time as each request completes, so
-a crash only loses the requests that were in-flight at that moment.
-`--resume` requires `--output-jsonl`.
+Each source row is tracked by its content fingerprint plus its occurrence
+count, so duplicate rows are resumed independently. Re-ordering the input file
+before resuming is safe, and resumed rows keep the original `_index` values
+from the first run. Removing rows, adding rows, or deduplicating the input
+before resuming is not supported. Results are written to disk one row at a
+time as each request completes, so a crash only loses the requests that were
+in-flight at that moment.
+
+The workflow keeps a rolling in-flight window, so each settled row immediately
+admits the next pending row until the source is exhausted. Output rows are
+written in completion order, not input order.
+Row-level generation failures become per-item `error` rows and do not abort
+their siblings, but setup and workflow failures still stop the command.
+Use the `_index` field to re-sort after the run if needed.
+
+`--resume` requires `--output-jsonl` and the matching checkpoint file from a
+previous file-backed run. If the checkpoint is missing,
+if the input and output paths are the same file, if the output file is missing
+any settled `_index` rows recorded in the checkpoint, or if the current input
+does not match the original row occurrences, infermesh fails fast instead of
+guessing.
+
+### Custom Input Mapping with `--mapper`
+
+Use `--mapper` to transform raw source records before they are sent to the
+model. This lets you drive generation from any record format without
+preprocessing the source file.
+
+```bash
+infermesh generate \
+  --model openai/gpt-4.1-mini \
+  --input-jsonl dataset.jsonl \
+  --output-jsonl results.jsonl \
+  --mapper mypackage.prompts:build_prompt
+```
+
+The mapper is imported as `package.module:function`. The function receives
+each raw source record as a `dict` and must return a `dict` with at least an
+`"input"` key:
+
+```python
+# mypackage/prompts.py
+def build_prompt(record: dict) -> dict:
+    return {
+        "input": f"Classify the following text:\n\n{record['body']}",
+        "metadata": {"doc_id": record["id"]},
+    }
+```
+
+| Return key | Required | Notes |
+|---|---|---|
+| `"input"` | Yes | Passed directly to the generation endpoint |
+| `"metadata"` | No | Copied into the output row under `"metadata"` when it is a JSON-serializable dict |
+
+Extra keys beyond `"input"` and `"metadata"` are ignored. Mapper failures
+become per-item error rows — they do not abort the run. If you later resume a
+file-backed run, infermesh requires the same mapper implementation that wrote
+the original checkpoint file.
 
 ## Generate Text
 

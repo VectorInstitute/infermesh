@@ -14,7 +14,13 @@ import asyncio
 import contextlib
 import threading
 from collections.abc import Coroutine
-from concurrent.futures import Future
+from concurrent.futures import (
+    CancelledError,
+    Future,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -96,8 +102,89 @@ class SyncRunner:
         >>> runner.run(add(1, 2))
         3
         """
-        future: Future[T] = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
-        return future.result()
+        future: Future[T] = Future()
+        task_future: Future[asyncio.Task[T]] = Future()
+
+        def start_task() -> None:
+            try:
+                task = self._loop.create_task(coroutine)
+            except BaseException as exc:  # noqa: BLE001
+                coroutine.close()
+                if not task_future.done():
+                    task_future.set_exception(exc)
+                if not future.done():
+                    future.set_exception(exc)
+                return
+
+            if not task_future.done():
+                task_future.set_result(task)
+
+            def copy_result(completed_task: asyncio.Task[T]) -> None:
+                try:
+                    result = completed_task.result()
+                except asyncio.CancelledError:
+                    if not future.done():
+                        future.cancel()
+                except BaseException as exc:  # noqa: BLE001
+                    if not future.done():
+                        future.set_exception(exc)
+                else:
+                    if not future.done():
+                        future.set_result(result)
+
+            task.add_done_callback(copy_result)
+
+        try:
+            self._loop.call_soon_threadsafe(start_task)
+        except BaseException:
+            coroutine.close()
+            raise
+
+        try:
+            self._wait_for_future(task_future)
+            return self._wait_for_future(future)
+        except KeyboardInterrupt:
+            # The loop owns the task lifecycle, so cancellation must also
+            # happen on that thread. We wait for the task to finish unwinding
+            # before re-raising so callers do not tear down shared resources
+            # underneath an in-flight coroutine.
+            self._loop.call_soon_threadsafe(
+                self._cancel_task_after_handoff,
+                task_future,
+            )
+            self._wait_for_cancellation_cleanup(future)
+            raise
+
+    @staticmethod
+    def _cancel_task_after_handoff(task_future: Future[asyncio.Task[T]]) -> None:
+        """Cancel the loop-owned task after the handoff future completes."""
+
+        if not task_future.done():
+            return
+        with contextlib.suppress(BaseException):
+            task_future.result().cancel()
+
+    def _wait_for_cancellation_cleanup(self, future: Future[T]) -> None:
+        """Block until the cancelled task finishes unwinding on the loop."""
+
+        while True:
+            try:
+                self._wait_for_future(future, timeout=0.1)
+                return
+            except FutureTimeoutError:
+                continue
+            except KeyboardInterrupt:
+                continue
+            except CancelledError:
+                return
+            except Exception:
+                return
+
+    @staticmethod
+    def _wait_for_future(future: Future[T], timeout: float | None = None) -> T:
+        """Wait for a cross-thread future result."""
+
+        return future.result(timeout=timeout)
 
     def close(self) -> None:
         """Stop the background event loop and join the worker thread.

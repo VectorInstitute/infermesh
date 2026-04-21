@@ -7,7 +7,22 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
+from infermesh._workflow.checkpoint import (
+    _STATUS_NAMES,
+    _STATUS_VALUES,
+    _checkpoint_path_for,
+    _connect_checkpoint_db,
+    _connect_checkpoint_db_read_only,
+    _initialize_checkpoint_db,
+)
+from infermesh._workflow.mapping import _compute_mapping_fingerprint
+from infermesh._workflow.models import CheckpointKey
+from infermesh._workflow.source import (
+    _compute_parse_error_fingerprint,
+    _compute_record_fingerprint,
+)
 from infermesh.client import LMClient
+from infermesh.sync_runner import SyncRunner
 from infermesh.types import (
     BatchResult,
     EmbeddingResult,
@@ -186,18 +201,44 @@ class ToolCallingFakeLiteLLM(FakeLiteLLM):
 class FakeCLIClient:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self._sync_runner = SyncRunner()
         self.closed = False
         self.embed_batch_sizes: list[int] = []
         self.embed_micro_batch_sizes: list[int | None] = []
+        self.generate_inputs: list[Any] = []
+
+    def _run_sync(self, coroutine: Any) -> Any:
+        return self._sync_runner.run(coroutine)
 
     def close(self) -> None:
+        self._sync_runner.close()
         self.closed = True
 
     def generate(self, input_data: Any, **kwargs: Any) -> GenerationResult:
+        self.generate_inputs.append(input_data)
         return GenerationResult(
             model_id="test-model",
             output_text=f"generated:{input_data}",
             request_id="req-1",
+        )
+
+    async def agenerate(self, input_data: Any, **kwargs: Any) -> GenerationResult:
+        self.generate_inputs.append(input_data)
+        return GenerationResult(
+            model_id="test-model",
+            output_text=f"generated:{input_data}",
+            request_id="req-1",
+            token_usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
+            metrics=RequestMetrics(
+                queue_wait_s=0.01,
+                service_time_s=0.02,
+                end_to_end_s=0.03,
+                deployment="replica-1",
+            ),
         )
 
     def generate_batch(
@@ -264,6 +305,122 @@ class FakeCLIClient:
             text=f"transcribed:{Path(path).name}",
             request_id="tx-1",
         )
+
+
+def load_resume_state(
+    checkpoint_path: Path,
+) -> dict[CheckpointKey, dict[str, Any]]:
+    """Load checkpoint items for test assertions."""
+
+    if not checkpoint_path.exists():
+        return {}
+
+    connection = _connect_checkpoint_db_read_only(checkpoint_path)
+    try:
+        state: dict[CheckpointKey, dict[str, Any]] = {}
+        for row in connection.execute(
+            """
+            SELECT record_fingerprint, occurrence, output_index, status, error
+            FROM items
+            """
+        ):
+            status = int(row[3])
+            state[CheckpointKey(bytes(row[0]), int(row[1]))] = {
+                "_index": int(row[2]),
+                "status": _STATUS_NAMES[status],
+                "error": row[4],
+            }
+        return state
+    finally:
+        connection.close()
+
+
+def checkpoint_item_for_record(
+    record: dict[str, Any],
+    *,
+    occurrence: int,
+    index: int,
+    status: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build a checkpoint item payload for a well-formed source record."""
+
+    return {
+        "record_fingerprint": _compute_record_fingerprint(record),
+        "occurrence": occurrence,
+        "_index": index,
+        "status": status,
+        "error": error,
+    }
+
+
+def checkpoint_item_for_parse_error(
+    raw_line: str,
+    *,
+    occurrence: int,
+    index: int,
+    status: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build a checkpoint item payload for a malformed source line."""
+
+    return {
+        "record_fingerprint": _compute_parse_error_fingerprint(raw_line),
+        "occurrence": occurrence,
+        "_index": index,
+        "status": status,
+        "error": error,
+    }
+
+
+def write_checkpoint_db(
+    output_path: Path,
+    items: list[dict[str, Any]],
+    *,
+    mapping_fingerprint: str | None = None,
+    checkpoint_dir: str | None = None,
+) -> Path:
+    """Create a checkpoint DB for tests and populate it with explicit items."""
+
+    checkpoint_path = _checkpoint_path_for(
+        str(output_path), checkpoint_dir=checkpoint_dir
+    )
+    connection = _connect_checkpoint_db(checkpoint_path)
+    try:
+        resolved_mapping_fingerprint = (
+            mapping_fingerprint
+            or _compute_mapping_fingerprint(
+                mapper_spec=None,
+                mapper=None,
+            )
+        )
+        _initialize_checkpoint_db(connection, resolved_mapping_fingerprint)
+        connection.executemany(
+            """
+            INSERT INTO items (
+                record_fingerprint,
+                occurrence,
+                output_index,
+                status,
+                error
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["record_fingerprint"],
+                    item["occurrence"],
+                    item["_index"],
+                    _STATUS_VALUES[item["status"]],
+                    item["error"],
+                )
+                for item in items
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return checkpoint_path
 
 
 @pytest.fixture

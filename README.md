@@ -174,20 +174,28 @@ infermesh generate \
 
 # Generate — from a JSONL file, results to another JSONL file
 # Each input line: {"prompt": "..."} or {"messages": [...]} or {"responses_input": "..."}
-# Output includes an _index field so interrupted runs can be resumed.
+# Output includes an _index field; a checkpoint file results.checkpoint.sqlite is kept.
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl
 
-# Resume an interrupted run — skips already-completed rows and appends new ones
+# Resume an interrupted run — reads results.checkpoint.sqlite, skips settled rows, appends the rest
 infermesh generate \
   --model openai/gpt-4.1-mini \
   --api-base https://api.openai.com/v1 \
   --input-jsonl prompts.jsonl \
   --output-jsonl results.jsonl \
   --resume
+
+# Custom mapper — transform raw source records before sending to the model
+# The mapper receives each record as a dict; must return {"input": ..., "metadata": ...}
+infermesh generate \
+  --model openai/gpt-4.1-mini \
+  --input-jsonl dataset.jsonl \
+  --output-jsonl results.jsonl \
+  --mapper mypackage.prompts:build_prompt
 
 # Create embeddings
 infermesh embed \
