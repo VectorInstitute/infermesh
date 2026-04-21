@@ -15,7 +15,11 @@ def test_sync_runner_waits_for_cancel_cleanup_on_keyboard_interrupt(
 ) -> None:
     runner = SyncRunner()
     started = threading.Event()
+    cleanup_started = threading.Event()
+    allow_cleanup_finish = threading.Event()
     cleaned = threading.Event()
+    returned = threading.Event()
+    result: dict[str, BaseException | None] = {"error": None}
 
     async def blocked() -> None:
         started.set()
@@ -23,9 +27,8 @@ def test_sync_runner_waits_for_cancel_cleanup_on_keyboard_interrupt(
             while True:
                 await asyncio.sleep(0.01)
         finally:
-            # Cleanup can take longer than the main result wait; run() should
-            # still wait for it before returning control to the caller.
-            await asyncio.sleep(2.1)
+            cleanup_started.set()
+            await asyncio.to_thread(allow_cleanup_finish.wait)
             cleaned.set()
 
     original_wait_for_future = runner._wait_for_future
@@ -45,11 +48,26 @@ def test_sync_runner_waits_for_cancel_cleanup_on_keyboard_interrupt(
 
     monkeypatch.setattr(runner, "_wait_for_future", interrupting_wait_for_future)
 
-    try:
-        with pytest.raises(KeyboardInterrupt):
+    def run_and_capture() -> None:
+        try:
             runner.run(blocked())
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+        finally:
+            returned.set()
+
+    try:
+        worker = threading.Thread(target=run_and_capture, daemon=True)
+        worker.start()
+        assert cleanup_started.wait(timeout=1.0)
+        assert not returned.wait(timeout=0.05)
+        allow_cleanup_finish.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert isinstance(result["error"], KeyboardInterrupt)
         assert cleaned.is_set()
     finally:
+        allow_cleanup_finish.set()
         runner.close()
 
 
