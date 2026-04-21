@@ -9,7 +9,7 @@ import pytest
 
 from infermesh import cli
 from infermesh._cli_support import _client_config_from_args
-from infermesh._workflow import _checkpoint_path_for
+from infermesh._workflow.checkpoint import _checkpoint_path_for
 from tests.fakes import FakeCLIClient, checkpoint_item_for_record, write_checkpoint_db
 
 _BASE_ARGS = [

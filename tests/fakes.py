@@ -7,15 +7,19 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
-from infermesh._workflow import (
+from infermesh._workflow.checkpoint import (
     _STATUS_NAMES,
     _STATUS_VALUES,
     _checkpoint_path_for,
-    _compute_mapping_fingerprint,
+    _connect_checkpoint_db,
+    _connect_checkpoint_db_read_only,
+    _initialize_checkpoint_db,
+)
+from infermesh._workflow.mapping import _compute_mapping_fingerprint
+from infermesh._workflow.models import CheckpointKey
+from infermesh._workflow.source import (
     _compute_parse_error_fingerprint,
     _compute_record_fingerprint,
-    _connect_checkpoint_db,
-    _initialize_checkpoint_db,
 )
 from infermesh.client import LMClient
 from infermesh.sync_runner import SyncRunner
@@ -305,15 +309,15 @@ class FakeCLIClient:
 
 def load_resume_state(
     checkpoint_path: Path,
-) -> dict[tuple[bytes, int], dict[str, Any]]:
+) -> dict[CheckpointKey, dict[str, Any]]:
     """Load checkpoint items for test assertions."""
 
     if not checkpoint_path.exists():
         return {}
 
-    connection = _connect_checkpoint_db(checkpoint_path)
+    connection = _connect_checkpoint_db_read_only(checkpoint_path)
     try:
-        state: dict[tuple[bytes, int], dict[str, Any]] = {}
+        state: dict[CheckpointKey, dict[str, Any]] = {}
         for row in connection.execute(
             """
             SELECT record_fingerprint, occurrence, output_index, status, error
@@ -321,7 +325,7 @@ def load_resume_state(
             """
         ):
             status = int(row[3])
-            state[(bytes(row[0]), int(row[1]))] = {
+            state[CheckpointKey(bytes(row[0]), int(row[1]))] = {
                 "_index": int(row[2]),
                 "status": _STATUS_NAMES[status],
                 "error": row[4],

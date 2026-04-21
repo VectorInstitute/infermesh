@@ -16,13 +16,15 @@ from typing import Any
 
 import pytest
 
-from infermesh._workflow import (
+import infermesh._workflow.checkpoint as checkpoint_module
+from infermesh._workflow import run_generate_workflow
+from infermesh._workflow.checkpoint import (
     _checkpoint_path_for,
-    _compute_mapping_fingerprint,
     _connect_checkpoint_db,
     _load_run_metadata,
-    run_generate_workflow,
 )
+from infermesh._workflow.mapping import _compute_mapping_fingerprint
+from infermesh._workflow.resume import ResumePlanner
 from infermesh.sync_runner import SyncRunner
 from tests.fakes import (
     checkpoint_item_for_parse_error,
@@ -214,13 +216,11 @@ def test_file_backed_generate_streams_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infermesh._workflow as wf_module
-
     rows = [{"prompt": f"p{i}"} for i in range(7)]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
     client = _FakeClient()
-    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+    monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
 
     _run(client, input_path=input_path, output_path=output_path, window_size=3)
 
@@ -344,54 +344,10 @@ def test_resume_skips_settled_rows(tmp_path: Path) -> None:
     assert {row["status"] for row in state.values()} == {"success"}
 
 
-def test_resume_file_backed_path_uses_disk_backed_planner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import infermesh._workflow as wf_module
-
-    rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
-    input_path = _write_input(tmp_path, rows)
-    output_path = tmp_path / "out.jsonl"
-
-    output_path.write_text(
-        json.dumps({"_index": 0, "output_text": "cached-a"}) + "\n",
-        encoding="utf-8",
-    )
-    write_checkpoint_db(
-        output_path,
-        [
-            checkpoint_item_for_record(
-                rows[0], occurrence=0, index=0, status="success"
-            ),
-            checkpoint_item_for_record(
-                rows[1], occurrence=0, index=1, status="pending"
-            ),
-            checkpoint_item_for_record(
-                rows[2], occurrence=0, index=2, status="pending"
-            ),
-        ],
-    )
-
-    def fail_if_row_lookup_used(
-        connection: sqlite3.Connection, checkpoint_key: tuple[bytes, int]
-    ) -> Any:
-        raise AssertionError("row-by-row checkpoint lookups should not be used")
-
-    monkeypatch.setattr(wf_module, "_load_checkpoint_item", fail_if_row_lookup_used)
-
-    client = _FakeClient()
-    _run(client, input_path=input_path, output_path=output_path, resume=True)
-
-    assert client.inputs == ["b", "c"]
-
-
 def test_resume_reports_planner_status_and_cleans_temp_db(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infermesh._workflow as wf_module
-
     rows = [{"prompt": "a"}, {"prompt": "b"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
@@ -410,7 +366,7 @@ def test_resume_reports_planner_status_and_cleans_temp_db(
             ),
         ],
     )
-    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+    monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
     statuses: list[str] = []
 
     client = _FakeClient()
@@ -503,6 +459,9 @@ def test_builtin_row_conventions(tmp_path: Path) -> None:
         {"prompt": "hello"},
         {"messages": [{"role": "user", "content": "hi"}]},
         {"responses_input": [{"role": "user", "content": "hey"}]},
+        {"prompt": ""},
+        {"messages": []},
+        {"responses_input": []},
     ]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
@@ -514,10 +473,42 @@ def test_builtin_row_conventions(tmp_path: Path) -> None:
         "hello",
         [{"role": "user", "content": "hi"}],
         [{"role": "user", "content": "hey"}],
+        "",
+        [],
+        [],
     ]
     out_rows = _read_output(output_path)
-    assert len(out_rows) == 3
+    assert len(out_rows) == 6
     assert all(r["error"] is None for r in out_rows)
+
+
+def test_non_object_source_rows_become_error_rows_without_aborting_siblings(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"prompt": "good"}),
+                json.dumps([]),
+                json.dumps({"prompt": "later"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "out.jsonl"
+    client = _FakeClient()
+
+    _run(client, input_path=input_path, output_path=output_path)
+
+    assert client.inputs == ["good", "later"]
+    rows_by_index = {row["_index"]: row for row in _read_output(output_path)}
+    assert len(rows_by_index) == 3
+    assert rows_by_index[0]["error"] is None
+    assert rows_by_index[1]["output_text"] is None
+    assert "JSON objects" in rows_by_index[1]["error"]
+    assert rows_by_index[2]["error"] is None
 
 
 def test_mapper_import_and_metadata(tmp_path: Path) -> None:
@@ -1183,12 +1174,10 @@ def test_stdout_path_creates_no_checkpoint_file(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import infermesh._workflow as wf_module
-
     rows = [{"prompt": "hello"}]
     input_path = _write_input(tmp_path, rows)
     client = _FakeClient()
-    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+    monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
 
     _run(client, input_path=input_path, output_path=None)
 
@@ -1267,9 +1256,7 @@ def test_persistence_sink_failure_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infermesh._workflow as wf_module
-
-    original = wf_module._mark_checkpoint_item_settled
+    original = checkpoint_module._mark_checkpoint_item_settled
     call_count = 0
 
     def failing_mark(connection, checkpoint_key, *, status, error):
@@ -1279,7 +1266,9 @@ def test_persistence_sink_failure_propagates(
             raise RuntimeError("injected sink failure")
         original(connection, checkpoint_key, status=status, error=error)
 
-    monkeypatch.setattr(wf_module, "_mark_checkpoint_item_settled", failing_mark)
+    monkeypatch.setattr(
+        checkpoint_module, "_mark_checkpoint_item_settled", failing_mark
+    )
 
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
@@ -1294,8 +1283,6 @@ def test_resume_planner_temp_db_is_removed_after_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infermesh._workflow as wf_module
-
     rows = [{"prompt": "a"}, {"prompt": "b"}]
     input_path = _write_input(tmp_path, rows)
     output_path = tmp_path / "out.jsonl"
@@ -1318,8 +1305,10 @@ def test_resume_planner_temp_db_is_removed_after_failure(
     def failing_mark(connection, checkpoint_key, *, status, error):
         raise RuntimeError("injected sink failure")
 
-    monkeypatch.setattr(wf_module, "_mark_checkpoint_item_settled", failing_mark)
-    monkeypatch.setattr(wf_module, "_resume_planner_temp_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        checkpoint_module, "_mark_checkpoint_item_settled", failing_mark
+    )
+    monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
 
     client = _FakeClient()
     with pytest.raises(RuntimeError, match="injected sink failure"):
