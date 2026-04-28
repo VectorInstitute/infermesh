@@ -1,6 +1,6 @@
 [project]
 name = "infermesh"
-version = "0.3.0"
+version = "0.3.1"
 description = "Run large LLM batches from notebooks and scripts without rewriting concurrency or rate-limit glue."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -21,8 +21,8 @@ classifiers = [
 requires-python = ">=3.12"
 dependencies = [
     "jsonschema>=4.0.0",
-    "litellm>=1.83.0",
-    "pydantic>=2.13.0",
+    "litellm>=1.83.7",
+    "pydantic>=2.12.5",
     "python-dotenv>=1.0.0",
     "tqdm>=4.0.0",
 ]
