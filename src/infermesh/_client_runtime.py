@@ -524,7 +524,16 @@ class _ClientRuntimeMixin:
         import litellm
         import litellm._logging
 
-        litellm._logging.verbose_logger.setLevel(logging.WARNING)
+        self._set_default_litellm_logger_level(litellm._logging.verbose_logger)
         if hasattr(litellm._logging, "verbose_router_logger"):
-            litellm._logging.verbose_router_logger.setLevel(logging.WARNING)
+            self._set_default_litellm_logger_level(
+                litellm._logging.verbose_router_logger
+            )
         return litellm
+
+    @staticmethod
+    def _set_default_litellm_logger_level(litellm_logger: logging.Logger) -> None:
+        """Keep LiteLLM quiet unless the caller already configured its logger."""
+
+        if litellm_logger.level == logging.NOTSET:
+            litellm_logger.setLevel(logging.WARNING)

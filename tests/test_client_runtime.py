@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -16,6 +17,51 @@ from tests.fakes import (
     ParsedResponse,
     ToolCallingFakeLiteLLM,
 )
+
+
+def _litellm_verbose_loggers() -> list[logging.Logger]:
+    """Return LiteLLM loggers that ``LMClient`` quiets by default."""
+
+    import litellm._logging
+
+    loggers = [litellm._logging.verbose_logger]
+    router_logger = getattr(litellm._logging, "verbose_router_logger", None)
+    if router_logger is not None:
+        loggers.append(router_logger)
+    return loggers
+
+
+def _restore_logger_levels(levels: dict[logging.Logger, int]) -> None:
+    for logger, level in levels.items():
+        logger.setLevel(level)
+
+
+def test_litellm_debug_loggers_are_preserved() -> None:
+    loggers = _litellm_verbose_loggers()
+    original_levels = {logger: logger.level for logger in loggers}
+    for logger in loggers:
+        logger.setLevel(logging.DEBUG)
+
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    try:
+        assert all(logger.level == logging.DEBUG for logger in loggers)
+    finally:
+        client.close()
+        _restore_logger_levels(original_levels)
+
+
+def test_litellm_loggers_default_to_warning_when_unconfigured() -> None:
+    loggers = _litellm_verbose_loggers()
+    original_levels = {logger: logger.level for logger in loggers}
+    for logger in loggers:
+        logger.setLevel(logging.NOTSET)
+
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    try:
+        assert all(logger.level == logging.WARNING for logger in loggers)
+    finally:
+        client.close()
+        _restore_logger_levels(original_levels)
 
 
 @pytest.mark.asyncio
