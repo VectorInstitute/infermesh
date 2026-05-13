@@ -153,16 +153,16 @@ async def _close_batch_workflow_resources(
     """Close resources and re-raise the first cleanup error."""
 
     loop = asyncio.get_running_loop()
-    cleanup_error: BaseException | None = None
+    cleanup_error: Exception | None = None
     if work_stream is not None:
         try:
             await loop.run_in_executor(executor, work_stream.close)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             cleanup_error = exc
     for close in (source.close, store.close):
         try:
             close()
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             if cleanup_error is None:
                 cleanup_error = exc
     if cleanup_error is not None:

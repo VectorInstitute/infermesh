@@ -53,7 +53,6 @@ _STATUS_NAMES = {
     _SUCCESS_STATUS: "success",
     _ERROR_STATUS: "error",
 }
-_STATUS_VALUES = {name: value for value, name in _STATUS_NAMES.items()}
 _RESUME_SOURCE_MISMATCH_ERROR = (
     "Resume source does not match the checkpoint file. Added, removed, or "
     "modified row occurrences are not supported."
@@ -452,14 +451,14 @@ class _FileBackedPersistenceSink:
                         status=item.status,
                         error=item.error,
                     )
-                except BaseException as exc:  # noqa: BLE001
+                except Exception as exc:
                     self._set_failure(exc)
                     item.failure = exc
                     item.done.set()
                     self._fail_pending_items(exc)
                     return
                 item.done.set()
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             self._set_failure(exc)
             self._fail_pending_items(exc)
         finally:
@@ -483,8 +482,10 @@ class _FileBackedPersistenceSink:
             self._failure = exc
 
     def _raise_if_failed(self) -> None:
-        if self._failure is not None:
-            raise self._failure
+        failure = self._failure
+        if failure is None:
+            return
+        raise failure
 
     def _fail_pending_items(self, exc: BaseException) -> None:
         while True:
@@ -1470,22 +1471,22 @@ class SqliteFileRunStore:
 
         Raises
         ------
-        BaseException
+        Exception
             Re-raises the first sink or planner cleanup error.
         """
 
-        cleanup_error: BaseException | None = None
+        cleanup_error: Exception | None = None
         try:
             if self._sink is not None:
                 self._sink.close()
                 self._sink = None
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             cleanup_error = exc
 
         try:
             ResumePlanner.cleanup(self._resume_plan)
             self._resume_plan = None
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             if cleanup_error is None:
                 cleanup_error = exc
 
