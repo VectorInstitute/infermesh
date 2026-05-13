@@ -14,7 +14,9 @@ from infermesh._workflow.source import (
     _compute_record_fingerprint,
 )
 from infermesh._workflow.store import (
-    _STATUS_NAMES,
+    _ERROR_STATUS,
+    _PENDING_STATUS,
+    _SUCCESS_STATUS,
     _checkpoint_path_for,
     _connect_checkpoint_db,
     _connect_checkpoint_db_read_only,
@@ -31,6 +33,11 @@ from infermesh.types import (
     TranscriptionResult,
 )
 
+_STATUS_NAMES = {
+    _PENDING_STATUS: "pending",
+    _SUCCESS_STATUS: "success",
+    _ERROR_STATUS: "error",
+}
 _STATUS_VALUES = {name: value for value, name in _STATUS_NAMES.items()}
 
 

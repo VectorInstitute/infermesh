@@ -48,11 +48,6 @@ _PENDING_STATUS = 0
 _SUCCESS_STATUS = 1
 _ERROR_STATUS = 2
 _SETTLED_STATUSES = frozenset({_SUCCESS_STATUS, _ERROR_STATUS})
-_STATUS_NAMES = {
-    _PENDING_STATUS: "pending",
-    _SUCCESS_STATUS: "success",
-    _ERROR_STATUS: "error",
-}
 _RESUME_SOURCE_MISMATCH_ERROR = (
     "Resume source does not match the checkpoint file. Added, removed, or "
     "modified row occurrences are not supported."
