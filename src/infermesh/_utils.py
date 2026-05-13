@@ -6,7 +6,6 @@ import itertools
 import json
 import logging
 import os
-import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -33,7 +32,20 @@ T = TypeVar("T")
 
 # Used only when vLLM embeds thinking tokens inline in `content` rather than
 # exposing them via the structured `reasoning_content` message field.
-_LEADING_THINK_RE = re.compile(r"<think>(.*?)</think>[ \t\r\n]*", re.DOTALL)
+# Common delimiter families: DeepSeek-style pipe tags (e.g. think / redacted
+# reasoning), and simple angle-bracketed think tags.
+_PIPE_THINK_OPEN = "<|think|>"
+_PIPE_THINK_CLOSE = "<|/think|>"
+_REDACTED_REASONING_OPEN = "<|redacted_reasoning|>"
+_REDACTED_REASONING_CLOSE = "<|/redacted_reasoning|>"
+_ANGLE_THINK_OPEN = "<think>"
+_ANGLE_THINK_CLOSE = "</think>"
+
+_THINK_TAG_PAIRS = (
+    (_PIPE_THINK_OPEN, _PIPE_THINK_CLOSE),
+    (_REDACTED_REASONING_OPEN, _REDACTED_REASONING_CLOSE),
+    (_ANGLE_THINK_OPEN, _ANGLE_THINK_CLOSE),
+)
 
 
 def validate_endpoint(endpoint: str) -> None:
@@ -565,12 +577,12 @@ def _join_texts(texts: list[str]) -> str:
 
 
 def _extract_thinking_tokens(text: str) -> tuple[str, str | None]:
-    """Strip leading ``<think>…</think>`` blocks from model output.
+    """Strip leading thinking content from model output.
 
-    Only removes blocks that appear at the very start of the string (after any
-    leading whitespace).  A ``<think>`` tag that appears mid-response is left
-    in place and treated as literal content, avoiding false-positive stripping
-    when a model legitimately outputs XML-like tags.
+    Inline thinking extraction first handles complete leading blocks with known
+    delimiters. Some vLLM-compatible servers emit only the closing delimiter, so
+    a lone close marker is also treated as a boundary when it has non-empty text
+    on both sides and is followed by whitespace.
 
     Parameters
     ----------
@@ -583,20 +595,55 @@ def _extract_thinking_tokens(text: str) -> tuple[str, str | None]:
         ``(clean_text, reasoning)`` where *reasoning* is the concatenated
         content of all removed leading blocks, or ``None`` when none were found.
     """
-    if "<think>" not in text:
-        return text, None
     remaining = text.lstrip()
     reasoning_parts: list[str] = []
-    while remaining.startswith("<think>"):
-        m = _LEADING_THINK_RE.match(remaining)
-        if m is None:
+
+    while remaining:
+        for open_marker, close_marker in _THINK_TAG_PAIRS:
+            if not remaining.startswith(open_marker):
+                continue
+            close_idx = remaining.find(close_marker, len(open_marker))
+            if close_idx == -1:
+                return text, None
+            reasoning_parts.append(remaining[len(open_marker) : close_idx].strip())
+            remaining = remaining[close_idx + len(close_marker) :].lstrip()
             break
-        reasoning_parts.append(m.group(1).strip())
-        remaining = remaining[m.end() :]
+        else:
+            break
 
     if not reasoning_parts:
+        split = _split_after_first_think_close(remaining)
+        if split is not None:
+            return split
         return text, None
-    return remaining, "\n\n".join(reasoning_parts)
+    reasoning = "\n\n".join(part for part in reasoning_parts if part) or None
+    return remaining, reasoning
+
+
+def _split_after_first_think_close(text: str) -> tuple[str, str] | None:
+    """Split malformed inline thinking output on the first close delimiter."""
+
+    best_idx: int | None = None
+    best_marker: str | None = None
+    for _, close_marker in _THINK_TAG_PAIRS:
+        idx = text.find(close_marker)
+        if idx == -1:
+            continue
+        if best_idx is None or idx < best_idx:
+            best_idx = idx
+            best_marker = close_marker
+    if best_idx is None or best_marker is None:
+        return None
+
+    reasoning = text[:best_idx].strip()
+    raw_answer = text[best_idx + len(best_marker) :]
+    if not reasoning or not raw_answer or not raw_answer[0].isspace():
+        return None
+
+    answer = raw_answer.lstrip()
+    if not answer:
+        return None
+    return answer, reasoning
 
 
 def _is_chat_input(input_data: Any) -> bool:

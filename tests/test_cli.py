@@ -9,7 +9,7 @@ import pytest
 
 from infermesh import cli
 from infermesh._cli_support import _client_config_from_args
-from infermesh._workflow.checkpoint import _checkpoint_path_for
+from infermesh._workflow.store import _checkpoint_path_for
 from tests.fakes import FakeCLIClient, checkpoint_item_for_record, write_checkpoint_db
 
 _BASE_ARGS = [
@@ -123,7 +123,7 @@ def test_generate_surfaces_workflow_failure_cleanly(
     def blow_up(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(cli, "run_generate_workflow", blow_up)
+    monkeypatch.setattr(cli, "run_generate_from_files", blow_up)
 
     exit_code = cli.main([*_BASE_ARGS, "--prompt", "hello"])
 

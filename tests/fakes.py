@@ -7,19 +7,20 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
-from infermesh._workflow.checkpoint import (
-    _STATUS_NAMES,
-    _STATUS_VALUES,
-    _checkpoint_path_for,
-    _connect_checkpoint_db,
-    _connect_checkpoint_db_read_only,
-    _initialize_checkpoint_db,
-)
 from infermesh._workflow.mapping import _compute_mapping_fingerprint
 from infermesh._workflow.models import CheckpointKey
 from infermesh._workflow.source import (
     _compute_parse_error_fingerprint,
     _compute_record_fingerprint,
+)
+from infermesh._workflow.store import (
+    _ERROR_STATUS,
+    _PENDING_STATUS,
+    _SUCCESS_STATUS,
+    _checkpoint_path_for,
+    _connect_checkpoint_db,
+    _connect_checkpoint_db_read_only,
+    _initialize_checkpoint_db,
 )
 from infermesh.client import LMClient
 from infermesh.sync_runner import SyncRunner
@@ -31,6 +32,13 @@ from infermesh.types import (
     TokenUsage,
     TranscriptionResult,
 )
+
+_STATUS_NAMES = {
+    _PENDING_STATUS: "pending",
+    _SUCCESS_STATUS: "success",
+    _ERROR_STATUS: "error",
+}
+_STATUS_VALUES = {name: value for value, name in _STATUS_NAMES.items()}
 
 
 class FakeLiteLLM:

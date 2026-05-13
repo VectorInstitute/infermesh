@@ -30,7 +30,7 @@ async def test_rate_limiter_adjust_receives_headers(
         calls.append((actual_tokens, response_headers))
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.adjust", fake_adjust)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.adjust", fake_adjust)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -104,7 +104,7 @@ async def test_cancelled_rate_limiter_wait_does_not_dispatch(
         return {}, None
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.acquire", fake_acquire)
     monkeypatch.setattr(LMClient, "_call_generation", fake_call_generation)
     client = LMClient(model="openai/test", api_base="http://localhost", rpm=10)
     with pytest.raises(asyncio.CancelledError):
@@ -124,7 +124,7 @@ async def test_default_output_tokens_used_when_no_max_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -148,7 +148,7 @@ async def test_per_request_max_tokens_overrides_default_output_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -172,7 +172,7 @@ async def test_default_request_kwargs_max_tokens_overrides_default_output_tokens
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",
@@ -197,7 +197,7 @@ async def test_responses_max_output_tokens_overrides_default_output_tokens(
         return RateLimiterAcquisitionHandle(tokens)
 
     monkeypatch.setattr(LMClient, "_create_litellm_module", lambda self: FakeLiteLLM())
-    monkeypatch.setattr("infermesh.client.RateLimiter.acquire", fake_acquire)
+    monkeypatch.setattr("infermesh.rate_limiter.RateLimiter.acquire", fake_acquire)
     client = LMClient(
         model="openai/test",
         api_base="http://localhost",

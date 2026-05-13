@@ -16,15 +16,24 @@ from typing import Any
 
 import pytest
 
-import infermesh._workflow.checkpoint as checkpoint_module
-from infermesh._workflow import run_generate_workflow
-from infermesh._workflow.checkpoint import (
+from infermesh._workflow import run_generate_from_files
+from infermesh._workflow.engine import run_batch_workflow
+from infermesh._workflow.mapping import _compute_mapping_fingerprint
+from infermesh._workflow.models import (
+    CheckpointKey,
+    PreparedItem,
+    SettledRecord,
+    SourceItem,
+)
+from infermesh._workflow.store import (
+    ResumePlanner,
+    SqliteFileRunStore,
+    StdoutRunStore,
     _checkpoint_path_for,
     _connect_checkpoint_db,
     _load_run_metadata,
+    _mark_checkpoint_item_settled,
 )
-from infermesh._workflow.mapping import _compute_mapping_fingerprint
-from infermesh._workflow.resume import ResumePlanner
 from infermesh.sync_runner import SyncRunner
 from tests.fakes import (
     checkpoint_item_for_parse_error,
@@ -32,6 +41,7 @@ from tests.fakes import (
     load_resume_state,
     write_checkpoint_db,
 )
+from tests.workflow_fakes import InMemoryRunStore, InMemorySourceStream
 
 # ---------------------------------------------------------------------------
 # Fake client
@@ -172,7 +182,7 @@ def _run(
     on_status: Any = None,
 ) -> None:
     try:
-        run_generate_workflow(
+        run_generate_from_files(
             client,  # type: ignore[arg-type]
             prompt=prompt,
             input_jsonl=str(input_path) if input_path is not None else None,
@@ -207,9 +217,113 @@ def _load_checkpoint_journal_mode(checkpoint_path: Path) -> str:
         connection.close()
 
 
+def _source_item(index: int, value: str) -> SourceItem:
+    return SourceItem(
+        output_index=index,
+        checkpoint_key=CheckpointKey(value.encode("utf-8"), 0),
+        mapped_input=value,
+    )
+
+
+async def _fake_batch_operation(
+    item: SourceItem,
+) -> tuple[_FakeResult | None, BaseException | None]:
+    if item.mapped_input == "boom":
+        return None, RuntimeError("boom")
+    return _FakeResult(output_text=f"out:{item.mapped_input}"), None
+
+
+def _fake_batch_record_builder(
+    item: SourceItem,
+    result: Any,
+    error: BaseException | None,
+) -> dict[str, Any]:
+    return {
+        "_index": item.output_index,
+        "output_text": None if result is None else result.output_text,
+        "error": None if error is None else str(error),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_workflow_core_settles_successes_and_errors() -> None:
+    items = [_source_item(0, "a"), _source_item(1, "boom"), _source_item(2, "c")]
+    source = InMemorySourceStream(
+        [
+            PreparedItem(
+                output_index=item.output_index,
+                checkpoint_key=item.checkpoint_key,
+                item=item,
+            )
+            for item in items
+        ]
+    )
+    store = InMemoryRunStore(skipped=2)
+
+    summary = await run_batch_workflow(
+        source=source,
+        store=store,
+        operation=_fake_batch_operation,
+        record_builder=_fake_batch_record_builder,
+        resume=True,
+        mapping_fingerprint="test",
+        window_size=2,
+    )
+
+    records_by_index = sorted(store.records, key=lambda record: record.output_index)
+    assert [record.record["error"] for record in records_by_index] == [
+        None,
+        "boom",
+        None,
+    ]
+    assert summary.total == 5
+    assert summary.completed == 2
+    assert summary.errored == 1
+    assert summary.skipped == 2
+    assert source.closed
+    assert store.closed
+
+
+@pytest.mark.asyncio
+async def test_batch_workflow_core_settles_immediate_errors_without_operation() -> None:
+    item = _source_item(0, "unused")
+    source = InMemorySourceStream(
+        [
+            PreparedItem(
+                output_index=item.output_index,
+                checkpoint_key=item.checkpoint_key,
+                item=None,
+                immediate_error=ValueError("bad row"),
+            )
+        ]
+    )
+    store = InMemoryRunStore()
+    called = False
+
+    async def operation(_: SourceItem) -> tuple[Any, BaseException | None]:
+        nonlocal called
+        called = True
+        return None, None
+
+    summary = await run_batch_workflow(
+        source=source,
+        store=store,
+        operation=operation,
+        record_builder=_fake_batch_record_builder,
+        resume=False,
+        mapping_fingerprint="test",
+        window_size=1,
+    )
+
+    assert not called
+    assert store.records[0].record["error"] == "bad row"
+    assert summary.completed == 0
+    assert summary.errored == 1
 
 
 def test_file_backed_generate_streams_input(
@@ -242,9 +356,11 @@ def test_default_checkpoint_uses_portable_rollback_journaling(tmp_path: Path) ->
     _run(client, input_path=input_path, output_path=output_path)
 
     assert checkpoint_path.exists()
-    assert _load_checkpoint_journal_mode(checkpoint_path) in {"persist", "delete"}
+    assert _load_checkpoint_journal_mode(checkpoint_path) == "delete"
+    assert not Path(f"{checkpoint_path}-journal").exists()
     assert not Path(f"{checkpoint_path}-wal").exists()
     assert not Path(f"{checkpoint_path}-shm").exists()
+    assert not list(checkpoint_path.parent.glob(f".{checkpoint_path.name}.*.tmp*"))
 
 
 def test_checkpoint_override_disambiguates_same_output_basename(tmp_path: Path) -> None:
@@ -741,6 +857,44 @@ def test_fresh_run_bootstrap_failure_preserves_existing_artifacts(
     assert client.inputs == []
 
 
+def test_fresh_run_replace_failure_leaves_resume_detectable_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_row = {"prompt": "old"}
+    input_path = _write_input(tmp_path, [{"prompt": "new"}])
+    output_path = tmp_path / "out.jsonl"
+    checkpoint_path = _checkpoint_path_for(str(output_path))
+    output_path.write_text(
+        json.dumps({"_index": 0, "output_text": "cached-old"}) + "\n",
+        encoding="utf-8",
+    )
+    write_checkpoint_db(
+        output_path,
+        [checkpoint_item_for_record(old_row, occurrence=0, index=0, status="success")],
+    )
+    old_checkpoint = checkpoint_path.read_bytes()
+    original_replace = Path.replace
+
+    def fail_checkpoint_replace(self: Path, target: str | Path) -> Path:
+        if Path(target) == checkpoint_path:
+            raise RuntimeError("crash after output replace")
+        return original_replace(self, target)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "replace", fail_checkpoint_replace)
+        client = _FakeClient()
+        with pytest.raises(RuntimeError, match="crash after output replace"):
+            _run(client, input_path=input_path, output_path=output_path)
+
+    assert output_path.read_text(encoding="utf-8") == ""
+    assert checkpoint_path.read_bytes() == old_checkpoint
+
+    resume_client = _FakeClient()
+    with pytest.raises(ValueError, match="missing settled checkpoint rows"):
+        _run(resume_client, input_path=input_path, output_path=output_path, resume=True)
+
+
 def test_resume_skips_items_from_checkpoint_file(tmp_path: Path) -> None:
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
@@ -1197,6 +1351,85 @@ def test_stdout_path_creates_no_checkpoint_file(
     assert out_rows[0]["error"] is None
 
 
+def test_stdout_store_rejects_resume() -> None:
+    store = StdoutRunStore()
+    source = InMemorySourceStream([])
+
+    with pytest.raises(ValueError, match="--resume requires --output-jsonl"):
+        store.open(source, resume=True, mapping_fingerprint="test")
+
+
+@pytest.mark.asyncio
+async def test_stdout_store_flushes_after_each_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeStdout:
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+            self.flush_count = 0
+
+        def write(self, value: str) -> None:
+            self.writes.append(value)
+
+        def flush(self) -> None:
+            self.flush_count += 1
+
+    fake_stdout = _FakeStdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    store = StdoutRunStore()
+
+    await store.settle(
+        SettledRecord(
+            output_index=0,
+            checkpoint_key=CheckpointKey(b"row", 0),
+            record={"_index": 0, "output_text": "hello"},
+        )
+    )
+
+    assert fake_stdout.flush_count == 1
+    assert fake_stdout.writes == [
+        json.dumps({"_index": 0, "output_text": "hello"}) + "\n"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_store_settle_does_not_block_event_loop(tmp_path: Path) -> None:
+    class _BlockingSink:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def write_record(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            self.started.set()
+            if not self.release.wait(timeout=1.0):
+                raise RuntimeError("sink was not released")
+
+    store = SqliteFileRunStore(
+        output_jsonl=str(tmp_path / "out.jsonl"),
+        checkpoint_dir=None,
+    )
+    sink = _BlockingSink()
+    store._sink = sink  # type: ignore[assignment]
+
+    settle_task = asyncio.create_task(
+        store.settle(
+            SettledRecord(
+                output_index=0,
+                checkpoint_key=CheckpointKey(b"row", 0),
+                record={"_index": 0, "output_text": "hello"},
+            )
+        )
+    )
+    assert await asyncio.to_thread(sink.started.wait, 1.0)
+
+    await asyncio.sleep(0)
+    assert not settle_task.done()
+
+    sink.release.set()
+    await asyncio.wait_for(settle_task, timeout=1.0)
+
+
 def test_invalid_metadata_becomes_error_row_without_aborting_siblings(
     tmp_path: Path,
 ) -> None:
@@ -1263,7 +1496,7 @@ def test_persistence_sink_failure_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = checkpoint_module._mark_checkpoint_item_settled
+    original = _mark_checkpoint_item_settled
     call_count = 0
 
     def failing_mark(connection, checkpoint_key, *, status, error):
@@ -1274,7 +1507,8 @@ def test_persistence_sink_failure_propagates(
         original(connection, checkpoint_key, status=status, error=error)
 
     monkeypatch.setattr(
-        checkpoint_module, "_mark_checkpoint_item_settled", failing_mark
+        "infermesh._workflow.store._mark_checkpoint_item_settled",
+        failing_mark,
     )
 
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
@@ -1313,7 +1547,8 @@ def test_resume_planner_temp_db_is_removed_after_failure(
         raise RuntimeError("injected sink failure")
 
     monkeypatch.setattr(
-        checkpoint_module, "_mark_checkpoint_item_settled", failing_mark
+        "infermesh._workflow.store._mark_checkpoint_item_settled",
+        failing_mark,
     )
     monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
 

@@ -1,7 +1,5 @@
 """Command-line interface for ``infermesh``."""
 
-from __future__ import annotations
-
 import argparse
 import os
 import sys
@@ -35,7 +33,7 @@ from infermesh._cli_support import (
 )
 from infermesh._cli_support import _build_client as _support_build_client
 from infermesh._utils import batched_cycle
-from infermesh._workflow import run_generate_workflow
+from infermesh._workflow import run_generate_from_files
 from infermesh.client import LMClient
 
 
@@ -370,7 +368,7 @@ def _handle_generate(args: argparse.Namespace) -> int:
                 else:
                     bar.write(message)
 
-            run_generate_workflow(
+            run_generate_from_files(
                 client,
                 prompt=args.prompt,
                 input_jsonl=args.input_jsonl,
