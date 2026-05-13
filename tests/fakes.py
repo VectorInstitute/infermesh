@@ -15,7 +15,6 @@ from infermesh._workflow.source import (
 )
 from infermesh._workflow.store import (
     _STATUS_NAMES,
-    _STATUS_VALUES,
     _checkpoint_path_for,
     _connect_checkpoint_db,
     _connect_checkpoint_db_read_only,
@@ -31,6 +30,8 @@ from infermesh.types import (
     TokenUsage,
     TranscriptionResult,
 )
+
+_STATUS_VALUES = {name: value for value, name in _STATUS_NAMES.items()}
 
 
 class FakeLiteLLM:

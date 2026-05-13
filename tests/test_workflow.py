@@ -16,7 +16,6 @@ from typing import Any
 
 import pytest
 
-import infermesh._workflow.store as store_module
 from infermesh._workflow import run_generate_from_files
 from infermesh._workflow.engine import run_batch_workflow
 from infermesh._workflow.mapping import _compute_mapping_fingerprint
@@ -33,6 +32,7 @@ from infermesh._workflow.store import (
     _checkpoint_path_for,
     _connect_checkpoint_db,
     _load_run_metadata,
+    _mark_checkpoint_item_settled,
 )
 from infermesh.sync_runner import SyncRunner
 from tests.fakes import (
@@ -1427,7 +1427,7 @@ async def test_file_store_settle_does_not_block_event_loop(tmp_path: Path) -> No
     assert not settle_task.done()
 
     sink.release.set()
-    await settle_task
+    await asyncio.wait_for(settle_task, timeout=1.0)
 
 
 def test_invalid_metadata_becomes_error_row_without_aborting_siblings(
@@ -1496,7 +1496,7 @@ def test_persistence_sink_failure_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = store_module._mark_checkpoint_item_settled
+    original = _mark_checkpoint_item_settled
     call_count = 0
 
     def failing_mark(connection, checkpoint_key, *, status, error):
@@ -1506,7 +1506,10 @@ def test_persistence_sink_failure_propagates(
             raise RuntimeError("injected sink failure")
         original(connection, checkpoint_key, status=status, error=error)
 
-    monkeypatch.setattr(store_module, "_mark_checkpoint_item_settled", failing_mark)
+    monkeypatch.setattr(
+        "infermesh._workflow.store._mark_checkpoint_item_settled",
+        failing_mark,
+    )
 
     rows = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
     input_path = _write_input(tmp_path, rows)
@@ -1543,7 +1546,10 @@ def test_resume_planner_temp_db_is_removed_after_failure(
     def failing_mark(connection, checkpoint_key, *, status, error):
         raise RuntimeError("injected sink failure")
 
-    monkeypatch.setattr(store_module, "_mark_checkpoint_item_settled", failing_mark)
+    monkeypatch.setattr(
+        "infermesh._workflow.store._mark_checkpoint_item_settled",
+        failing_mark,
+    )
     monkeypatch.setattr(ResumePlanner, "_temp_dir", lambda: tmp_path)
 
     client = _FakeClient()
