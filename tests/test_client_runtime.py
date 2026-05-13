@@ -249,6 +249,122 @@ async def test_inline_thinking_tokens_stripped_from_output_text(
 
 
 @pytest.mark.asyncio
+async def test_pipe_thinking_tokens_stripped_from_output_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PipeThinkingFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "id": "think-pipe-1",
+                "model": kwargs["model"],
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "<|think|>\nchain-of-thought here\n"
+                                '<|/think|>\n\n{"answer": "ok"}'
+                            )
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 10,
+                    "total_tokens": 13,
+                },
+            }
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: PipeThinkingFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    result = await client.agenerate(
+        'say {"answer": "ok"}',
+        response_format=ParsedResponse,
+    )
+    assert result.output_text == '{"answer": "ok"}'
+    assert result.reasoning == "chain-of-thought here"
+    assert result.output_parsed is not None
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_think_close_splits_reasoning_from_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preamble = "Thinking Process:\n\n1. Analyze the request.\n2. Draft answer.ot"
+    body = f"{preamble}\n</think>\n\n**Final answer** here."
+
+    class OrphanCloseFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "id": "think-orphan-1",
+                "model": kwargs["model"],
+                "choices": [
+                    {
+                        "message": {"content": body},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 10,
+                    "total_tokens": 13,
+                },
+            }
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: OrphanCloseFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    result = await client.agenerate("prompt")
+    assert result.output_text == "**Final answer** here."
+    assert result.reasoning == preamble
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_literal_mid_response_think_close_stays_in_output_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "To close the tag, write </think>."
+
+    class LiteralCloseFakeLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "id": "think-literal-1",
+                "model": kwargs["model"],
+                "choices": [
+                    {
+                        "message": {"content": body},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 10,
+                    "total_tokens": 13,
+                },
+            }
+
+    monkeypatch.setattr(
+        LMClient,
+        "_create_litellm_module",
+        lambda self: LiteralCloseFakeLiteLLM(),
+    )
+    client = LMClient(model="openai/test", api_base="http://localhost")
+    result = await client.agenerate("prompt")
+    assert result.output_text == body
+    assert result.reasoning is None
+    client.close()
+
+
+@pytest.mark.asyncio
 async def test_reasoning_content_field_populates_reasoning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

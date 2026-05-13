@@ -7,19 +7,19 @@ import pytest
 from pydantic import BaseModel
 
 from infermesh import cli
-from infermesh._workflow.checkpoint import (
+from infermesh._workflow.mapping import _compute_mapping_fingerprint
+from infermesh._workflow.models import CheckpointKey
+from infermesh._workflow.source import (
+    _compute_parse_error_fingerprint,
+    _compute_record_fingerprint,
+)
+from infermesh._workflow.store import (
     _STATUS_NAMES,
     _STATUS_VALUES,
     _checkpoint_path_for,
     _connect_checkpoint_db,
     _connect_checkpoint_db_read_only,
     _initialize_checkpoint_db,
-)
-from infermesh._workflow.mapping import _compute_mapping_fingerprint
-from infermesh._workflow.models import CheckpointKey
-from infermesh._workflow.source import (
-    _compute_parse_error_fingerprint,
-    _compute_record_fingerprint,
 )
 from infermesh.client import LMClient
 from infermesh.sync_runner import SyncRunner

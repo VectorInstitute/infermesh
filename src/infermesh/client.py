@@ -41,7 +41,6 @@ from infermesh._client_runtime import _ClientRuntimeMixin
 from infermesh._embedding import _aembed_batch, _aembed_one
 from infermesh._generation import _agenerate_batch, _agenerate_one
 from infermesh._transcription import _atranscribe_batch, _atranscribe_one
-from infermesh.rate_limiter import RateLimiter as _RateLimiter
 from infermesh.types import (
     DeploymentConfig,
     EmbeddingBatchResult,
@@ -61,8 +60,6 @@ from infermesh.types import (
 
 logger = logging.getLogger(__name__)
 DEFAULT_MAX_TRANSCRIPTION_BYTES = 25 * 1024 * 1024
-# Backwards-compatible module alias for existing patch/import targets.
-RateLimiter = _RateLimiter
 
 
 class LMClient(_ClientRuntimeMixin):

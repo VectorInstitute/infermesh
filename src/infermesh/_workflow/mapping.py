@@ -1,7 +1,5 @@
 """Mapper loading and mapping strategy helpers for the workflow engine."""
 
-from __future__ import annotations
-
 import contextlib
 import hashlib
 import importlib
@@ -34,48 +32,6 @@ def _load_mapper(mapper_spec: str) -> Callable[[dict[str, Any]], Any]:
             f"--mapper: {mapper_spec!r} resolved to a non-callable {type(func).__name__!r}"
         )
     return cast(Callable[[dict[str, Any]], Any], func)
-
-
-def _apply_mapper_or_builtin(
-    raw_record: dict[str, Any], mapper: Callable[[dict[str, Any]], Any] | None
-) -> tuple[Any, dict[str, Any] | None] | Exception:
-    """Apply the mapper (or built-in field extraction) to ``raw_record``."""
-
-    if mapper is not None:
-        try:
-            result = mapper(raw_record)
-        except Exception as exc:  # noqa: BLE001
-            return exc
-        if not isinstance(result, dict):
-            return ValueError(
-                f"Mapper must return a dict, got {type(result).__name__!r}"
-            )
-        if "input" not in result:
-            return KeyError("Mapper return value is missing required key 'input'")
-        return result["input"], result.get("metadata")
-
-    missing = object()
-    for key in ("responses_input", "messages", "prompt"):
-        input_data = raw_record.get(key, missing)
-        if input_data is not missing and input_data is not None:
-            return input_data, None
-    return ValueError(
-        "Generation rows require 'prompt', 'messages', or 'responses_input'."
-    )
-
-
-def _validate_metadata(metadata: Any) -> dict[str, Any] | None | Exception:
-    """Validate mapper metadata before it reaches the sink."""
-
-    if metadata is None:
-        return None
-    if not isinstance(metadata, dict):
-        return TypeError("Mapper 'metadata' must be a dict when provided.")
-    try:
-        json.dumps(metadata)
-    except TypeError as exc:
-        return TypeError(f"Mapper 'metadata' must be JSON serializable: {exc}")
-    return metadata
 
 
 def _compute_mapper_implementation_fingerprint(

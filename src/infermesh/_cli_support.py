@@ -1,7 +1,5 @@
 """Private support helpers for ``infermesh.cli``."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -341,43 +339,4 @@ def _token_usage_to_dict(result: Any) -> dict[str, Any] | None:
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
         "reasoning_tokens": usage.reasoning_tokens,
-    }
-
-
-def _maybe_parse_json(value: str) -> Any:
-    """Try to parse a JSON string."""
-
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return None
-
-
-def _build_generation_record(
-    orig_idx: int,
-    result: Any,
-    error: BaseException | None,
-    *,
-    parse_json: bool,
-) -> dict[str, Any]:
-    """Convert one generation result into its JSONL output shape."""
-
-    if result is None:
-        return {
-            "_index": orig_idx,
-            "output_text": None,
-            "output_parsed": None,
-            "token_usage": None,
-            "request_id": None,
-            "finish_reason": None,
-            "error": str(error) if error else "unknown error",
-        }
-    return {
-        "_index": orig_idx,
-        "output_text": result.output_text,
-        "output_parsed": _maybe_parse_json(result.output_text) if parse_json else None,
-        "token_usage": _token_usage_to_dict(result),
-        "request_id": result.request_id,
-        "finish_reason": result.finish_reason,
-        "error": None,
     }

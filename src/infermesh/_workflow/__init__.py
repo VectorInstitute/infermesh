@@ -1,5 +1,5 @@
 """Internal workflow package."""
 
-from .engine import run_generate_workflow
+from .generate import run_generate_from_files
 
-__all__ = ["run_generate_workflow"]
+__all__ = ["run_generate_from_files"]
