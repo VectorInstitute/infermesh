@@ -9,7 +9,7 @@ authors = [
 ]
 keywords = ["llm", "litellm", "async", "rate-limiting", "inference"]
 classifiers = [
-    "Development Status :: 3 - Beta",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
@@ -51,6 +51,12 @@ infermesh = "infermesh.cli:main"
 [build-system]
 requires = ["uv_build>=0.9.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+# litellm caps filelock below 4, but only filelock 4.2.1+ fixes CVE-2026-112907,
+# CVE-2026-112913 and CVE-2026-112940. Override the cap for the locked
+# environment; remove once litellm allows filelock 4.
+override-dependencies = ["filelock>=4.2.1"]
 
 [tool.uv.build-backend]
 module-root = "src"
